@@ -32,6 +32,11 @@ migrate_working_dir/
 .pub/
 /build/
 /coverage/
+/supabase.dev.json
+/test_payload.json
+/test_res.json
+/test_somali_tts.ps1
+/test_tts.ps1
 
 # Symbolication related
 app.*.symbols

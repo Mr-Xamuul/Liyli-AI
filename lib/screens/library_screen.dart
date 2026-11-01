@@ -1,10 +1,18 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../models/prepared_book.dart';
 import '../services/book_knowledge_storage.dart';
 import '../services/form_preference_storage.dart';
 import '../services/gemini_book_chat_service.dart';
 import '../services/prepared_book_storage.dart';
+import '../services/admin_auth_service.dart';
+import '../models/user_profile.dart';
+import '../services/supabase_config.dart';
+import '../services/user_auth_service.dart';
+import '../widgets/student_profile_dialog.dart';
 
 class LibraryScreen extends StatefulWidget {
   const LibraryScreen({
@@ -12,6 +20,7 @@ class LibraryScreen extends StatefulWidget {
     required this.onOpenEditor,
     required this.onOpenChat,
     this.onBackToChat,
+    this.onOpenAdmin,
   });
 
   final void Function(PreparedBook book) onOpenEditor;
@@ -24,13 +33,14 @@ class LibraryScreen extends StatefulWidget {
   })
   onOpenChat;
   final VoidCallback? onBackToChat;
+  final VoidCallback? onOpenAdmin;
 
   @override
   State<LibraryScreen> createState() => _LibraryScreenState();
 }
 
 class _LibraryScreenState extends State<LibraryScreen>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   final _storage = const PreparedBookStorage();
   final _knowledgeStorage = const BookKnowledgeStorage();
   final _formStorage = const FormPreferenceStorage();
@@ -38,46 +48,106 @@ class _LibraryScreenState extends State<LibraryScreen>
   late TabController _tabController;
   List<PreparedBook> _books = const [];
   bool _loading = true;
+  RealtimeChannel? _bookChangesChannel;
 
   static const _shelves = ['Form 1', 'Form 2', 'Form 3', 'Form 4'];
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _tabController = TabController(length: _shelves.length, vsync: this);
     _tabController.addListener(_handleTabChange);
+    _subscribeToBookChanges();
     _loadBooks();
+  }
+
+  void _subscribeToBookChanges() {
+    if (!SupabaseConfig.isInitialized ||
+        SupabaseConfig.client.auth.currentSession == null) {
+      return;
+    }
+
+    final client = SupabaseConfig.client;
+    _bookChangesChannel = client
+        .channel('student-library-books-${client.auth.currentUser!.id}')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'books',
+          callback: (_) {
+            // Re-read through PostgREST so the existing RLS policies decide
+            // which published books this signed-in user may see.
+            _loadBooks(showLoading: false);
+          },
+        )
+        .subscribe();
   }
 
   void _handleTabChange() {
     if (!_tabController.indexIsChanging &&
         _tabController.index >= 0 &&
         _tabController.index < _shelves.length) {
-      _formStorage.setSelectedForm(_shelves[_tabController.index]);
+      unawaited(_persistSelectedForm(_shelves[_tabController.index]));
+    }
+  }
+
+  Future<void> _persistSelectedForm(String form) async {
+    try {
+      await UserAuthService.instance.updateCurrentProfile(selectedForm: form);
+    } catch (error) {
+      debugPrint('Could not save selected student form: $error');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Fasalka lama kaydin karin. Isku day mar kale.'),
+        ),
+      );
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _loadBooks(showLoading: false);
     }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _tabController.removeListener(_handleTabChange);
     _tabController.dispose();
+    final channel = _bookChangesChannel;
+    if (channel != null && SupabaseConfig.isInitialized) {
+      unawaited(_removeBookChangesChannel(channel));
+    }
     super.dispose();
   }
 
-  Future<void> _loadBooks() async {
-    setState(() => _loading = true);
-    await _storage.seedSampleBooksIfEmpty(_knowledgeStorage);
-    final all = await _storage.loadAll();
-    final savedForm = await _formStorage.getSelectedForm();
-    final index = _shelves.indexOf(savedForm);
-    if (!mounted) return;
-    setState(() {
-      _books = all;
-      _loading = false;
-      if (index >= 0 && index < _shelves.length) {
-        _tabController.index = index;
-      }
-    });
+  Future<void> _removeBookChangesChannel(RealtimeChannel channel) async {
+    await SupabaseConfig.client.removeChannel(channel);
+  }
+
+  Future<void> _loadBooks({bool showLoading = true}) async {
+    if (showLoading && mounted) setState(() => _loading = true);
+    try {
+      await _storage.seedSampleBooksIfEmpty(_knowledgeStorage);
+      final all = await _storage.loadAll();
+      final savedForm = await _formStorage.getSelectedForm();
+      final index = _shelves.indexOf(savedForm);
+      if (!mounted) return;
+      setState(() {
+        _books = all;
+        _loading = false;
+        if (index >= 0 && index < _shelves.length) {
+          _tabController.index = index;
+        }
+      });
+    } catch (error) {
+      debugPrint('Could not refresh the student library: $error');
+      if (mounted && showLoading) setState(() => _loading = false);
+    }
   }
 
   List<PreparedBook> _booksInShelf(String shelf) {
@@ -203,6 +273,91 @@ class _LibraryScreenState extends State<LibraryScreen>
           ],
         ),
         actions: [
+          ValueListenableBuilder<bool>(
+            valueListenable: AdminAuthService.instance.isAdminNotifier,
+            builder: (context, isAdmin, _) {
+              if (!isAdmin) return const SizedBox.shrink();
+              return Container(
+                margin: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0022FF).withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: const Color(0xFF0022FF).withValues(alpha: 0.25),
+                    width: 1,
+                  ),
+                ),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(10),
+                  onTap: () {
+                    if (widget.onOpenAdmin != null) {
+                      widget.onOpenAdmin!();
+                    }
+                  },
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.admin_panel_settings_rounded,
+                          color: Color(0xFF0022FF),
+                          size: 19,
+                        ),
+                        SizedBox(width: 5),
+                        Text(
+                          'Admin',
+                          style: TextStyle(
+                            color: Color(0xFF0022FF),
+                            fontWeight: FontWeight.bold,
+                            fontSize: 12.5,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+          ValueListenableBuilder<UserProfile?>(
+            valueListenable: UserAuthService.instance.currentUserNotifier,
+            builder: (context, user, _) {
+              if (user == null) return const SizedBox.shrink();
+              return Tooltip(
+                message: 'Profile-ka (${user.displayName})',
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(20),
+                  onTap: () {
+                    StudentProfileDialog.show(
+                      context,
+                      onAccountChanged: () {
+                        _loadBooks();
+                      },
+                    );
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 8,
+                    ),
+                    child: CircleAvatar(
+                      radius: 14,
+                      backgroundColor: Color(user.avatarColorValue),
+                      child: Text(
+                        user.initials,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
           IconButton(
             tooltip: 'Dib u cusbooneysii',
             icon: const Icon(Icons.refresh),
@@ -311,21 +466,27 @@ class _LibraryScreenState extends State<LibraryScreen>
               ),
             ),
             const SizedBox(height: 20),
-            FilledButton.icon(
-              onPressed: () {
-                // Creates a new book draft in editor
-                final newBook = PreparedBook(
-                  id: DateTime.now().microsecondsSinceEpoch.toString(),
-                  title: 'Buug Cusub ($shelf)',
-                  originalFileName: 'cusub.pdf',
-                  pageCount: 1,
-                  category: shelf,
-                  chapters: const [],
+            ValueListenableBuilder<bool>(
+              valueListenable: AdminAuthService.instance.isAdminNotifier,
+              builder: (context, isAdmin, _) {
+                if (!isAdmin) return const SizedBox.shrink();
+                return FilledButton.icon(
+                  onPressed: () {
+                    // Creates a new book draft in editor
+                    final newBook = PreparedBook(
+                      id: DateTime.now().microsecondsSinceEpoch.toString(),
+                      title: 'Buug Cusub ($shelf)',
+                      originalFileName: 'cusub.pdf',
+                      pageCount: 1,
+                      category: shelf,
+                      chapters: const [],
+                    );
+                    widget.onOpenEditor(newBook);
+                  },
+                  icon: const Icon(Icons.add),
+                  label: Text('Diyaari Buug Cusub ($shelf)'),
                 );
-                widget.onOpenEditor(newBook);
               },
-              icon: const Icon(Icons.add),
-              label: Text('Diyaari Buug Cusub ($shelf)'),
             ),
           ],
         ),
@@ -474,53 +635,59 @@ class _LibraryScreenState extends State<LibraryScreen>
                       ],
                     ),
                   ),
-                  PopupMenuButton<String>(
-                    icon: const Icon(Icons.more_vert, size: 20),
-                    onSelected: (action) {
-                      if (action == 'editor') widget.onOpenEditor(book);
-                      if (action == 'shelf') _changeShelf(book);
-                      if (action == 'delete') _deleteBook(book);
+                  ValueListenableBuilder<bool>(
+                    valueListenable: AdminAuthService.instance.isAdminNotifier,
+                    builder: (context, isAdmin, _) {
+                      if (!isAdmin) return const SizedBox.shrink();
+                      return PopupMenuButton<String>(
+                        icon: const Icon(Icons.more_vert, size: 20),
+                        onSelected: (action) {
+                          if (action == 'editor') widget.onOpenEditor(book);
+                          if (action == 'shelf') _changeShelf(book);
+                          if (action == 'delete') _deleteBook(book);
+                        },
+                        itemBuilder: (_) => [
+                          const PopupMenuItem(
+                            value: 'editor',
+                            child: Row(
+                              children: [
+                                Icon(Icons.edit_outlined, size: 18),
+                                SizedBox(width: 8),
+                                Text('Tafatir Qaybta Editor-ka'),
+                              ],
+                            ),
+                          ),
+                          const PopupMenuItem(
+                            value: 'shelf',
+                            child: Row(
+                              children: [
+                                Icon(Icons.folder_shared_outlined, size: 18),
+                                SizedBox(width: 8),
+                                Text('U wareeji Qaanad kale'),
+                              ],
+                            ),
+                          ),
+                          const PopupMenuDivider(),
+                          const PopupMenuItem(
+                            value: 'delete',
+                            child: Row(
+                              children: [
+                                Icon(
+                                  Icons.delete_outline,
+                                  color: Color(0xFF000000),
+                                  size: 18,
+                                ),
+                                SizedBox(width: 8),
+                                Text(
+                                  'Tirtir',
+                                  style: TextStyle(color: Color(0xFF000000)),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      );
                     },
-                    itemBuilder: (_) => [
-                      const PopupMenuItem(
-                        value: 'editor',
-                        child: Row(
-                          children: [
-                            Icon(Icons.edit_outlined, size: 18),
-                            SizedBox(width: 8),
-                            Text('Tafatir Qaybta Editor-ka'),
-                          ],
-                        ),
-                      ),
-                      const PopupMenuItem(
-                        value: 'shelf',
-                        child: Row(
-                          children: [
-                            Icon(Icons.folder_shared_outlined, size: 18),
-                            SizedBox(width: 8),
-                            Text('U wareeji Qaanad kale'),
-                          ],
-                        ),
-                      ),
-                      const PopupMenuDivider(),
-                      const PopupMenuItem(
-                        value: 'delete',
-                        child: Row(
-                          children: [
-                            Icon(
-                              Icons.delete_outline,
-                              color: Color(0xFF000000),
-                              size: 18,
-                            ),
-                            SizedBox(width: 8),
-                            Text(
-                              'Tirtir',
-                              style: TextStyle(color: Color(0xFF000000)),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
                   ),
                 ],
               ),
@@ -572,16 +739,24 @@ class _LibraryScreenState extends State<LibraryScreen>
                       ),
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  OutlinedButton(
-                    onPressed: () => widget.onOpenEditor(book),
-                    style: OutlinedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 10,
-                      ),
-                    ),
-                    child: const Icon(Icons.edit_note, size: 20),
+                  ValueListenableBuilder<bool>(
+                    valueListenable: AdminAuthService.instance.isAdminNotifier,
+                    builder: (context, isAdmin, _) {
+                      if (!isAdmin) return const SizedBox.shrink();
+                      return Padding(
+                        padding: const EdgeInsets.only(left: 8),
+                        child: OutlinedButton(
+                          onPressed: () => widget.onOpenEditor(book),
+                          style: OutlinedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 10,
+                            ),
+                          ),
+                          child: const Icon(Icons.edit_note, size: 20),
+                        ),
+                      );
+                    },
                   ),
                 ],
               ),

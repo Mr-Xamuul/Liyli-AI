@@ -1,9 +1,22 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import 'models/user_profile.dart';
+import 'screens/google_auth_screen.dart';
 import 'screens/main_shell_screen.dart';
 
-void main() => runApp(const LeyliApp());
+import 'services/admin_auth_service.dart';
+import 'services/user_auth_service.dart';
+import 'services/supabase_config.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await SupabaseConfig.initialize();
+  SupabaseConfig.logConfigurationStatus();
+  await AdminAuthService.instance.init();
+  await UserAuthService.instance.init();
+  runApp(const LeyliApp());
+}
 
 class LeyliApp extends StatelessWidget {
   const LeyliApp({super.key});
@@ -46,10 +59,9 @@ class LeyliApp extends StatelessWidget {
     );
 
     final baseTextTheme = ThemeData.light().textTheme;
-    final typography = GoogleFonts.plusJakartaSansTextTheme(baseTextTheme).apply(
-      bodyColor: deepBlack,
-      displayColor: deepBlack,
-    );
+    final typography = GoogleFonts.plusJakartaSansTextTheme(
+      baseTextTheme,
+    ).apply(bodyColor: deepBlack, displayColor: deepBlack);
 
     return MaterialApp(
       title: 'Leyli AI - Waxbarashada Buugaagta',
@@ -80,13 +92,8 @@ class LeyliApp extends StatelessWidget {
             borderRadius: BorderRadius.circular(16),
           ),
         ),
-        dividerTheme: const DividerThemeData(
-          color: silverGrey,
-          thickness: 1,
-        ),
-        iconTheme: const IconThemeData(
-          color: deepBlack,
-        ),
+        dividerTheme: const DividerThemeData(color: silverGrey, thickness: 1),
+        iconTheme: const IconThemeData(color: deepBlack),
         filledButtonTheme: FilledButtonThemeData(
           style: FilledButton.styleFrom(
             backgroundColor: primaryBlue,
@@ -106,9 +113,7 @@ class LeyliApp extends StatelessWidget {
           ),
         ),
         textButtonTheme: TextButtonThemeData(
-          style: TextButton.styleFrom(
-            foregroundColor: deepBlack,
-          ),
+          style: TextButton.styleFrom(foregroundColor: deepBlack),
         ),
         inputDecorationTheme: InputDecorationTheme(
           fillColor: pureWhite,
@@ -127,7 +132,24 @@ class LeyliApp extends StatelessWidget {
           ),
         ),
       ),
-      home: const MainShellScreen(),
+      home: const AppAuthWrapper(),
+    );
+  }
+}
+
+class AppAuthWrapper extends StatelessWidget {
+  const AppAuthWrapper({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<UserProfile?>(
+      valueListenable: UserAuthService.instance.currentUserNotifier,
+      builder: (context, user, _) {
+        if (user == null) {
+          return GoogleAuthScreen(onAuthenticated: () {});
+        }
+        return MainShellScreen(key: ValueKey('main_shell_${user.id}'));
+      },
     );
   }
 }

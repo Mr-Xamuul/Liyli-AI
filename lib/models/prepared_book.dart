@@ -1,6 +1,6 @@
 import 'dart:convert';
 
-enum PreparedBookStatus { draft, review, published }
+enum PreparedBookStatus { draft, review, ready, published }
 
 class PreparedSection {
   const PreparedSection({
@@ -128,6 +128,9 @@ class PreparedBook {
     this.status = PreparedBookStatus.draft,
     this.category = 'Form 1',
     this.originalPdfPath,
+    this.verifiedItemIds = const [],
+    this.ocrCompleted = false,
+    this.ocrPageCount = 0,
     this.createdAt,
     this.updatedAt,
   });
@@ -142,10 +145,15 @@ class PreparedBook {
   final List<PreparedChapter> chapters;
   final PreparedBookStatus status;
   final String? originalPdfPath;
+  final List<String> verifiedItemIds;
+  final bool ocrCompleted;
+  final int ocrPageCount;
   final DateTime? createdAt;
   final DateTime? updatedAt;
 
   bool get isPublished => status == PreparedBookStatus.published;
+  bool get isReady => status == PreparedBookStatus.ready;
+  bool get isReview => status == PreparedBookStatus.review;
   bool get isDraft => status == PreparedBookStatus.draft;
 
   Map<String, dynamic> toJson() => {
@@ -157,6 +165,9 @@ class PreparedBook {
     'chapters': chapters.map((chapter) => chapter.toJson()).toList(),
     'status': status.name,
     'originalPdfPath': originalPdfPath,
+    'verifiedItemIds': verifiedItemIds,
+    'ocrCompleted': ocrCompleted,
+    'ocrPageCount': ocrPageCount,
     'createdAt': createdAt?.toIso8601String(),
     'updatedAt': updatedAt?.toIso8601String(),
   };
@@ -178,6 +189,11 @@ class PreparedBook {
       orElse: () => PreparedBookStatus.draft,
     ),
     originalPdfPath: json['originalPdfPath'] as String?,
+    verifiedItemIds: (json['verifiedItemIds'] as List<dynamic>? ?? const [])
+        .whereType<String>()
+        .toList(),
+    ocrCompleted: json['ocrCompleted'] as bool? ?? false,
+    ocrPageCount: json['ocrPageCount'] as int? ?? 0,
     createdAt: _date(json['createdAt']),
     updatedAt: _date(json['updatedAt']),
   );
@@ -192,6 +208,9 @@ class PreparedBook {
     List<PreparedChapter>? chapters,
     PreparedBookStatus? status,
     String? originalPdfPath,
+    List<String>? verifiedItemIds,
+    bool? ocrCompleted,
+    int? ocrPageCount,
     DateTime? updatedAt,
   }) => PreparedBook(
     id: id,
@@ -202,6 +221,9 @@ class PreparedBook {
     chapters: chapters ?? this.chapters,
     status: status ?? this.status,
     originalPdfPath: originalPdfPath ?? this.originalPdfPath,
+    verifiedItemIds: verifiedItemIds ?? this.verifiedItemIds,
+    ocrCompleted: ocrCompleted ?? this.ocrCompleted,
+    ocrPageCount: ocrPageCount ?? this.ocrPageCount,
     createdAt: createdAt,
     updatedAt: updatedAt ?? DateTime.now(),
   );

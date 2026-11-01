@@ -45,8 +45,10 @@ class PdfSliceService {
         double cropBottomRatio = 1.0;
 
         if (isSinglePage) {
-          cropTopRatio = cleanStartPos;
-          cropBottomRatio = cleanEndPos > cleanStartPos ? cleanEndPos : 1.0;
+          final top = cleanStartPos < cleanEndPos ? cleanStartPos : cleanEndPos;
+          final bottom = cleanStartPos < cleanEndPos ? cleanEndPos : cleanStartPos;
+          cropTopRatio = top;
+          cropBottomRatio = (bottom > top + 0.01) ? bottom : (top + 0.05).clamp(0.0, 1.0);
         } else {
           if (pageNum == clampedStart) {
             // First page: start at cleanStartPos and go to the bottom of the page
@@ -63,36 +65,38 @@ class PdfSliceService {
           }
         }
 
-        // Apply a small safety margin: if crop encompasses almost the full page, keep full height
-        final shouldCrop = (cropTopRatio > 0.02) || (cropBottomRatio < 0.98);
+        // Apply slicing: if crop ratio specifies a partial vertical slice
+        final shouldCrop = (cropTopRatio > 0.005) || (cropBottomRatio < 0.995);
 
         if (shouldCrop) {
           final topY = pageHeight * cropTopRatio;
           final bottomY = pageHeight * cropBottomRatio;
-          final sliceHeight = (bottomY - topY).clamp(20.0, pageHeight);
+          final sliceHeight = (bottomY - topY).clamp(10.0, pageHeight);
 
-          if (pageWidth > sliceHeight) {
-            targetDoc.pageSettings.orientation = PdfPageOrientation.landscape;
-            targetDoc.pageSettings.size = Size(sliceHeight, pageWidth);
-          } else {
-            targetDoc.pageSettings.orientation = PdfPageOrientation.portrait;
-            targetDoc.pageSettings.size = Size(pageWidth, sliceHeight);
-          }
+          // Crop strictly to the designated boundary height so preceding/succeeding
+          // sections and empty trailing space are not included in the sliced document.
+          targetDoc.pageSettings.setMargins(0);
+          targetDoc.pageSettings.orientation = (sliceHeight < pageWidth)
+              ? PdfPageOrientation.landscape
+              : PdfPageOrientation.portrait;
+          targetDoc.pageSettings.size = Size(pageWidth, sliceHeight);
+
           final newPage = targetDoc.pages.add();
 
-          // Draw the template shifted up so only the desired vertical window is in view
+          // Clip to slice window and draw the template shifted up
+          newPage.graphics.save();
+          newPage.graphics.setClip(bounds: Rect.fromLTWH(0, 0, pageWidth, sliceHeight));
           newPage.graphics.drawPdfTemplate(
             template,
             Offset(0, -topY),
             sourcePage.size,
           );
+          newPage.graphics.restore();
         } else {
-          targetDoc.pageSettings.orientation = (pageWidth > pageHeight)
-              ? PdfPageOrientation.landscape
-              : PdfPageOrientation.portrait;
-          targetDoc.pageSettings.size = (pageWidth > pageHeight)
-              ? Size(pageHeight, pageWidth)
-              : sourcePage.size;
+          targetDoc.pageSettings.setMargins(0);
+          targetDoc.pageSettings.orientation = PdfPageOrientation.portrait;
+          targetDoc.pageSettings.size = sourcePage.size;
+
           final newPage = targetDoc.pages.add();
           newPage.graphics.drawPdfTemplate(
             template,

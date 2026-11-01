@@ -4,11 +4,94 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/book_knowledge.dart';
 import '../models/learning_session.dart';
 import '../models/prepared_book.dart';
+import '../models/ai_model_config.dart';
+import '../models/agent_execution_trace.dart';
+import 'ai_api_key_resolver.dart';
+import 'ai_gateway_client.dart';
+import 'ai_model_storage.dart';
+import 'supabase_config.dart';
+
+typedef AgentToolExecutor =
+    Future<Map<String, dynamic>> Function(
+      String name,
+      Map<String, dynamic> arguments,
+    );
+typedef AgentToolCallObserver = void Function(AgentToolCallLog call);
+typedef AgentModelCallObserver = void Function(AgentModelCallLog modelCall);
+
+const _openAiAgentToolDeclarations = [
+  {
+    'type': 'function',
+    'function': {
+      'name': 'search_curriculum',
+      'description':
+          'Raadi buugaagta manhajka ee fasalka ardayga adigoo isticmaalaya amarro cad: "get_table_of_contents" (si aad 1-mar u hesho geedka buugga oo dhan), "get_chapter" (cutub gaar ah), ama "search_topic" (mowduuc gaar ah).',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'bookTitle': {
+            'type': 'string',
+            'description':
+                'Magaca buugga manhajka ee laga raadinayo (tusaale "Physics", "Business Studies", "Biology", iwm).',
+          },
+          'action': {
+            'type': 'string',
+            'description':
+                'Amarka: "get_table_of_contents" (si loo soo saaro geedka buugga oo dhan oo wata cutubyada, casharrada, iyo qaybaha), "get_chapter" (si loo helo cutub gaar ah), ama "search_topic" (si loo raadiyo mowduuc gaar ah).',
+            'enum': ['get_table_of_contents', 'get_chapter', 'search_topic'],
+          },
+          'chapter': {
+            'type': 'string',
+            'description':
+                'Ikhtiyaari: Magaca ama lambarka cutubka la rabo (tusaale "Measurement ll" ama "1").',
+          },
+          'topic': {
+            'type': 'string',
+            'description':
+                'Ikhtiyaari: Mawduuca ama erayada gaarka ah ee la raadinayo (tusaale "Measuring instruments", "Vernier Callipers").',
+          },
+          'query': {
+            'type': 'string',
+            'description': 'Ikhtiyaari: Qoraalka raadinta guud.',
+          },
+        },
+      },
+    },
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'get_lesson_pdf',
+      'description': 'Soo saar qoraalka iyo qaybta PDF ee casharka la doortay.',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'bookId': {
+            'type': 'string',
+            'description': 'ID-ga buugga ama Magaca buugga',
+          },
+          'chapterId': {
+            'type': 'string',
+            'description': 'ID-ga cutubka ama Magaca cutubka',
+          },
+          'lessonId': {
+            'type': 'string',
+            'description': 'ID-ga casharka ama Magaca casharka',
+          },
+          'sectionId': {
+            'type': 'string',
+            'description': 'Ikhtiyaari: ID-ga qaybta hoose (section)',
+          },
+        },
+        'required': ['bookId', 'lessonId'],
+      },
+    },
+  },
+];
 
 enum TutorMode {
   teach, // Baro qaybtaan: Cashar nidaamsan oo tillaabo-tillaabo ah
@@ -24,23 +107,140 @@ class GeminiBookChatService {
     : _customClient = client,
       _apiKey = apiKey;
 
-  static const _prefKey = 'custom_gemini_api_key';
   static const candidateModels = [
-    'gemini-3.7-flash',
-    'gemini-3.6-flash',
-    'gemini-3.5-flash',
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-1.5-flash',
   ];
 
   static const offlineMessage =
       '⚠️ Ma jiro xiriir internet. Fadlan hubi khadkaaga internet-ka.';
 
+  static const timeoutMessage =
+      '⚠️ Waqtigii jawaabta ayaa dhacay (Timeout ka badan 3 daqiiqo). Model-ka AI ayaa aad ugu raagay diyaarinta jawaabta ama wuxuu la kulmay culeys. Fadlan guji "Isku day markale" si aad dib ugu dirto.';
+
+  static const defaultRequestTimeout = Duration(minutes: 3);
+
+  static const _geminiAgentToolDeclarations = [
+    {
+      'name': 'search_curriculum',
+      'description':
+          'Raadi buugaagta manhajka ee fasalka ardayga adigoo isticmaalaya amarro cad: "get_table_of_contents" (si aad 1-mar u hesho geedka buugga oo dhan), "get_chapter" (cutub gaar ah), ama "search_topic" (mowduuc gaar ah).',
+      'parameters': {
+        'type': 'OBJECT',
+        'properties': {
+          'bookTitle': {
+            'type': 'STRING',
+            'description':
+                'Magaca buugga manhajka ee laga raadinayo (tusaale "Physics", "Business Studies", "Biology", iwm).',
+          },
+          'action': {
+            'type': 'STRING',
+            'description':
+                'Amarka: "get_table_of_contents" (si loo soo saaro geedka buugga oo dhan oo wata cutubyada, casharrada, iyo qaybaha), "get_chapter" (si loo helo cutub gaar ah), ama "search_topic" (si loo raadiyo mowduuc gaar ah).',
+            'enum': ['get_table_of_contents', 'get_chapter', 'search_topic'],
+          },
+          'chapter': {
+            'type': 'STRING',
+            'description':
+                'Ikhtiyaari: Magaca ama lambarka cutubka la rabo (tusaale "Measurement ll" ama "1").',
+          },
+          'topic': {
+            'type': 'STRING',
+            'description':
+                'Ikhtiyaari: Mawduuca ama erayada gaarka ah ee la raadinayo (tusaale "Measuring instruments", "Vernier Callipers").',
+          },
+          'query': {
+            'type': 'STRING',
+            'description': 'Ikhtiyaari: Qoraalka raadinta guud.',
+          },
+        },
+      },
+    },
+    {
+      'name': 'get_lesson_pdf',
+      'description': 'Soo saar qoraalka iyo qaybta PDF ee casharka la doortay.',
+      'parameters': {
+        'type': 'OBJECT',
+        'properties': {
+          'bookId': {
+            'type': 'STRING',
+            'description': 'ID-ga buugga ama Magaca buugga',
+          },
+          'chapterId': {
+            'type': 'STRING',
+            'description': 'ID-ga cutubka ama Magaca cutubka',
+          },
+          'lessonId': {
+            'type': 'STRING',
+            'description': 'ID-ga casharka ama Magaca casharka',
+          },
+          'sectionId': {
+            'type': 'STRING',
+            'description': 'Ikhtiyaari: ID-ga qaybta hoose (section)',
+          },
+        },
+        'required': ['bookId', 'lessonId'],
+      },
+    },
+  ];
+
+  static Map<String, dynamic> _traceSafeToolOutput(
+    Map<String, dynamic> output,
+  ) {
+    final safe = Map<String, dynamic>.from(output)..remove('_pdfBytes');
+    final extractedText = safe['extractedText'];
+    if (extractedText is String && extractedText.length > 3000) {
+      safe['extractedText'] = '${extractedText.substring(0, 3000)}…';
+      safe['extractedTextTruncated'] = true;
+    }
+    return safe;
+  }
+
+  static bool isCongestionOrBusyError(dynamic error) {
+    if (error == null) return false;
+    if (error is GeminiModelBusyException) return true;
+    final str = error.toString().toLowerCase();
+    return str.contains('503') ||
+        str.contains('429') ||
+        str.contains('high demand') ||
+        str.contains('resource_exhausted') ||
+        str.contains('overloaded') ||
+        str.contains('mashquul') ||
+        str.contains('ciriiri') ||
+        str.contains('rate limit') ||
+        str.contains('quota') ||
+        str.contains('too many requests') ||
+        str.contains('unavailable') ||
+        str.contains('temporarily unavailable') ||
+        str.contains('timeout') ||
+        str.contains('deadline') ||
+        str.contains('502') ||
+        str.contains('504') ||
+        str.contains('server error') ||
+        str.contains('clientexception') ||
+        str.contains('connection refused') ||
+        str.contains('failed to connect');
+  }
+
+  static bool isTimeoutError(dynamic error) {
+    if (error == null) return false;
+    if (error is GeminiTimeoutException) return true;
+    final str = error.toString().toLowerCase();
+    return error is TimeoutException ||
+        str.contains('timeoutexception') ||
+        str.contains('connection timed out') ||
+        str.contains('timeout') ||
+        str.contains('timed out');
+  }
+
   static bool isNetworkOrOfflineError(dynamic error) {
     if (error == null) return false;
+    if (isTimeoutError(error)) return false;
     final str = error.toString().toLowerCase();
     return error is SocketException ||
         error is http.ClientException ||
         error is HandshakeException ||
-        error is TimeoutException ||
         str.contains('socketexception') ||
         str.contains('failed host lookup') ||
         str.contains('network is unreachable') ||
@@ -49,36 +249,19 @@ class GeminiBookChatService {
         str.contains('connection refused') ||
         str.contains('connection closed') ||
         str.contains('connection reset') ||
-        str.contains('connection timed out') ||
         str.contains('network error') ||
-        str.contains('offline') ||
-        str.contains('timed out');
+        str.contains('offline');
   }
 
   final http.Client? _customClient;
   final String? _apiKey;
 
-  static Future<void> saveCustomApiKey(String key) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_prefKey, key.trim());
-  }
-
-  static Future<String?> getCustomApiKey() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_prefKey);
-  }
-
-  Future<String> _resolveApiKey() async {
+  Future<String> _resolveApiKey([AiModelConfig? modelConfig]) async {
+    // Explicit constructor keys are kept for injected clients and tests.
     final key = _apiKey;
     if (key != null && key.isNotEmpty) return key;
-    final custom = await getCustomApiKey();
-    if (custom != null && custom.trim().isNotEmpty) return custom.trim();
-    const envKey = String.fromEnvironment('GEMINI_API_KEY');
-    if (envKey.isNotEmpty) return envKey;
-    throw StateError(
-      'Gemini API key is not configured. Add one in the app or use '
-      '--dart-define=GEMINI_API_KEY=your-key.',
-    );
+    final config = modelConfig ?? await const AiModelStorage().getActiveModel();
+    return const AiApiKeyResolver().resolve(model: config, provider: 'Google');
   }
 
   Future<String> ask({
@@ -96,27 +279,137 @@ class GeminiBookChatService {
     int? learningPartNumber,
     int? learningPartCount,
     String priorLearningContext = '',
+    String conversationContext = '',
+    AgentToolExecutor? toolExecutor,
+    AgentToolCallObserver? onToolCall,
+    AgentModelCallObserver? onModelCall,
+    void Function({required String systemPrompt, required String userPrompt})?
+    onPromptGenerated,
+    String? studentFormLevel,
+    List<String>? availableBookTitles,
     bool isLessonCompletion = false,
+    AiModelConfig? modelConfig,
     void Function(String message, int step)? onProgress,
     CancellationToken? cancellationToken,
+    AgentTurnContext? turnContext,
   }) async {
     if (cancellationToken?.isCancelled == true) {
       throw const GeminiCancelledException();
     }
+    if (modelConfig != null &&
+        !modelConfig.isVerified &&
+        !modelConfig.isTesting) {
+      throw GeminiBookChatException(
+        'Model-ka "${modelConfig.displayName}" lama fasixin sababtoo ah ma shaqeynayo ama lama xaqiijin. Fadlan tag Editor > AI Manage si aad u hubiso.',
+      );
+    }
     onProgress?.call('Diyaarinta xogta & falanqaynta su\'aasha...', 1);
-    final apiKey = await _resolveApiKey();
-    final systemPrompt = _buildSystemPrompt(mode, learningScopeType);
+    final baseSystemPrompt = _buildSystemPrompt(mode, learningScopeType);
+
+    final catalogSection =
+        (availableBookTitles != null && availableBookTitles.isNotEmpty)
+        ? '''
+
+BUUGAAGTA MANHAJKA EE FASALKA ARDAYGA (${studentFormLevel ?? 'Fasalka Hadda'}):
+Buugaagta manhajka ee app-ka ugu diiwaangashan fasalkan waa:
+${availableBookTitles.map((t) => '- $t').join('\n')}
+
+HABKA AMARADA CAD EE RAADINTA MANHAJKA (Structured Action Commands):
+Tallaabada 1 (Dalbashada Geedka Manhajka):
+Marka ardaygu su'aal manhaj ah weydiiyo, wac "search_curriculum" adigoo isticmaalaya amarka ku habboon:
+• Soo saarista buugga oo dhan (Table of Contents):
+  search_curriculum(bookTitle: "Magaca Buugga", action: "get_table_of_contents")
+  (Tool-ku wuxuu 1-mar si shuruud la'aan ah kuugu soo celinayaa dhammaan Cutubyada, Casharrada, iyo Qaybaha Sections ee buugga).
+
+• Soo saarista cutub gaar ah:
+  search_curriculum(bookTitle: "Magaca Buugga", action: "get_chapter", chapter: "Cutubka")
+
+• Raadinta mawduuc gaar ah:
+  search_curriculum(bookTitle: "Magaca Buugga", action: "search_topic", topic: "Mawduuca")
+
+Tallaabada 2 (Soo Qaadashada Qoraalka & PDF-ka):
+Geedka aad hesho ka dhex dooro casharka ama qaybta (section) saxda ah, kadibna toos u wac:
+get_lesson_pdf(bookId: "...", chapterId: "...", lessonId: "...", sectionId: "...")
+App-ku wuxuu kuu soo saari doonaa qoraalka rasmiga ah iyo PDF-ka si aad ardayga ugu sharaxdo.
+Ha dhex gelin wareeg dheer; labadaas tallaabo toos u raac.
+'''
+        : '';
+
+    final systemPrompt = toolExecutor == null
+        ? baseSystemPrompt
+        : '''
+$baseSystemPrompt
+$catalogSection
+Marka ardaygu u baahan yahay xogta buugga, adigu wac qalabka ku habboon:
+- search_curriculum: isticmaal "action": "get_table_of_contents" ama "get_chapter" ama "search_topic".
+- get_lesson_pdf: soo qaado qoraalka iyo PDF-ka qaybta la helay.
+Sheeko caadi ah iyo dabagal cashar hore si toos ah uga jawaab; ha wicin tool haddii aan xog cusub loo baahnayn.
+Haddii aad sharaxaad manhaj ku salaysan bixinayso, raadi oo akhri PDF-ka ka hor intaadan jawaabin.
+''';
 
     if (book == null) {
       final userPrompt =
           '''
-Su'aasha Ardayga: $question
-
-Tilmaamaha Macallinka Leyli AI:
-- Waxaad tahay Leyli AI, macallin Soomaaliyeed oo caqli badan oo ardayda ka caawiya dhammaan maaddooyinka waxbarashada dugsiyada (Saynis, Xisaab, Fiisigis, Kimistari, Taariikh, Juqraafi, iwm).
-- Ugu jawaab su'aashiisa si hufan, cilmiyeysan, saaxiibtinimo leh oo Af-Soomaali sugan ah.
-- Haddii su'aashu u baahan tahay xisaab ama qaacidooyin, adeegso qaabka LaTeX (sida \$x\$ ama \$\$...\$\$).
+${conversationContext.isEmpty ? '' : 'Wada-hadalkii dhowaa ee ardayga iyo macallinka (xasuuso macnaha iyo casharka hadda socda):\n$conversationContext\n\n'}
+Fariinta ardayga: $question
 ''';
+      onPromptGenerated?.call(
+        systemPrompt: systemPrompt,
+        userPrompt: userPrompt,
+      );
+      if (modelConfig != null) {
+        onProgress?.call(
+          'Xiriirinta ${modelConfig.company} (${modelConfig.displayName})...',
+          2,
+        );
+        try {
+          final res = modelConfig.isOpenAiCompatible
+              ? await _callOpenAiCompatibleApi(
+                  config: modelConfig,
+                  systemPrompt: systemPrompt,
+                  userPrompt: userPrompt,
+                  cancellationToken: cancellationToken,
+                  toolExecutor: toolExecutor,
+                  onToolCall: onToolCall,
+                  onModelCall: onModelCall,
+                  turnContext: turnContext,
+                )
+              : await _callGeminiApi(
+                  model: modelConfig.modelId,
+                  apiKey: SupabaseConfig.isInitialized
+                      ? ''
+                      : await _resolveApiKey(modelConfig),
+                  systemPrompt: systemPrompt,
+                  userPrompt: userPrompt,
+                  baseUrl: modelConfig.baseUrl,
+                  cancellationToken: cancellationToken,
+                  toolExecutor: toolExecutor,
+                  onToolCall: onToolCall,
+                  onModelCall: onModelCall,
+                  turnContext: turnContext,
+                );
+          onProgress?.call('Habaynta sharraxaadda aqooneed ee Leyli AI...', 3);
+          return res;
+        } on GeminiCancelledException {
+          rethrow;
+        } catch (e) {
+          if (cancellationToken?.isCancelled == true) {
+            throw const GeminiCancelledException();
+          }
+          if (isTimeoutError(e)) {
+            throw const GeminiTimeoutException();
+          }
+          if (isNetworkOrOfflineError(e)) {
+            return offlineMessage;
+          }
+          if (e is GeminiBookChatException) rethrow;
+          throw GeminiBookChatException(
+            'Khalad ${modelConfig.displayName}: $e',
+          );
+        }
+      }
+
+      final apiKey = SupabaseConfig.isInitialized ? '' : await _resolveApiKey();
       onProgress?.call('Xiriirinta Google Gemini AI...', 2);
       String? lastError;
       for (final model in candidateModels) {
@@ -131,6 +424,9 @@ Tilmaamaha Macallinka Leyli AI:
             userPrompt: userPrompt,
             pdfBytes: null,
             cancellationToken: cancellationToken,
+            toolExecutor: toolExecutor,
+            onToolCall: onToolCall,
+            onModelCall: onModelCall,
           );
           if (cancellationToken?.isCancelled == true) {
             throw const GeminiCancelledException();
@@ -149,6 +445,10 @@ Tilmaamaha Macallinka Leyli AI:
 
       if (cancellationToken?.isCancelled == true) {
         throw const GeminiCancelledException();
+      }
+
+      if (isTimeoutError(lastError)) {
+        return timeoutMessage;
       }
 
       if (isNetworkOrOfflineError(lastError)) {
@@ -213,6 +513,13 @@ Waxaad i weydiin kartaa su'aal kasta oo ku saabsan maadooyinkaaga iyo casharrada
         )
         ..writeln(priorLearningContext);
     }
+    if (conversationContext.isNotEmpty) {
+      context
+        ..writeln(
+          '\nWada-hadalkii dhowaa (xasuuso macnaha iyo ujeeddada ardayga):',
+        )
+        ..writeln(conversationContext);
+    }
 
     final userPrompt = _buildUserPrompt(
       question: question,
@@ -230,7 +537,62 @@ Waxaad i weydiin kartaa su'aal kasta oo ku saabsan maadooyinkaaga iyo casharrada
       isLessonCompletion: isLessonCompletion,
     );
 
-    // Attempt Gemini call with active models in order
+    onPromptGenerated?.call(systemPrompt: systemPrompt, userPrompt: userPrompt);
+
+    // Attempt call with custom model or fallback candidate models
+    if (modelConfig != null) {
+      onProgress?.call(
+        'Weydiinta ${modelConfig.company} (${modelConfig.displayName})...',
+        2,
+      );
+      try {
+        final effectivePdf = slicedPdfBytes ?? turnContext?.discoveredPdfBytes;
+        final res = modelConfig.isOpenAiCompatible
+            ? await _callOpenAiCompatibleApi(
+                config: modelConfig,
+                systemPrompt: systemPrompt,
+                userPrompt: userPrompt,
+                cancellationToken: cancellationToken,
+                toolExecutor: toolExecutor,
+                onToolCall: onToolCall,
+                onModelCall: onModelCall,
+                turnContext: turnContext,
+              )
+            : await _callGeminiApi(
+                model: modelConfig.modelId,
+                apiKey: SupabaseConfig.isInitialized
+                    ? ''
+                    : await _resolveApiKey(modelConfig),
+                systemPrompt: systemPrompt,
+                userPrompt: userPrompt,
+                baseUrl: modelConfig.baseUrl,
+                pdfBytes: effectivePdf,
+                cancellationToken: cancellationToken,
+                toolExecutor: toolExecutor,
+                onToolCall: onToolCall,
+                onModelCall: onModelCall,
+                turnContext: turnContext,
+              );
+        onProgress?.call('Habaynta sharraxaadda aqooneed & koodhka...', 3);
+        return res;
+      } on GeminiCancelledException {
+        rethrow;
+      } catch (e) {
+        if (cancellationToken?.isCancelled == true) {
+          throw const GeminiCancelledException();
+        }
+        if (isTimeoutError(e)) {
+          throw const GeminiTimeoutException();
+        }
+        if (isNetworkOrOfflineError(e)) {
+          return offlineMessage;
+        }
+        if (e is GeminiBookChatException) rethrow;
+        throw GeminiBookChatException('Khalad ${modelConfig.displayName}: $e');
+      }
+    }
+
+    final apiKey = SupabaseConfig.isInitialized ? '' : await _resolveApiKey();
     onProgress?.call('Weydiinta Google Gemini AI & dhuuxista maaddada...', 2);
     String? lastError;
     for (final model in candidateModels) {
@@ -245,6 +607,9 @@ Waxaad i weydiin kartaa su'aal kasta oo ku saabsan maadooyinkaaga iyo casharrada
           userPrompt: userPrompt,
           pdfBytes: slicedPdfBytes,
           cancellationToken: cancellationToken,
+          toolExecutor: toolExecutor,
+          onToolCall: onToolCall,
+          onModelCall: onModelCall,
         );
         if (cancellationToken?.isCancelled == true) {
           throw const GeminiCancelledException();
@@ -263,6 +628,10 @@ Waxaad i weydiin kartaa su'aal kasta oo ku saabsan maadooyinkaaga iyo casharrada
 
     if (cancellationToken?.isCancelled == true) {
       throw const GeminiCancelledException();
+    }
+
+    if (isTimeoutError(lastError)) {
+      return timeoutMessage;
     }
 
     if (isNetworkOrOfflineError(lastError)) {
@@ -292,6 +661,12 @@ Waxaad i weydiin kartaa su'aal kasta oo ku saabsan maadooyinkaaga iyo casharrada
     TutorMode mode,
     LearningScopeType? learningScopeType,
   ) {
+    if (mode == TutorMode.freeChat) {
+      return '''
+Waxaad tahay Leyli, macallin AI ah oo ardayga ula sheekaysta si dabiici ah.
+Faham fariinta adigoo adeegsanaya macnaha wada-hadalka. Jawaab su'aasha hadda taagan si toos ah, Af-Soomaali cadna ku jawaab. Haddii xog gaar ah oo manhajka app-ka looga baahan yahay ay maqan tahay, dalbo tool-ka ku habboon; haddii kale jawaab adigoon tool wicin. Ha ku celin cashar dhan marka ardaygu weydiiyo dabagal kooban.
+''';
+    }
     return '''
 Waxaad tahay Leyli AI, macallin Soomaaliyeed oo caqli badan, saaxiibtinimo leh, kuna takhasusay buugaagta manhajka dugsiyada (Form 1 - Form 4).
 Hawshaada:
@@ -354,19 +729,25 @@ Hawshaada:
 
     switch (mode) {
       case TutorMode.teach:
+        final studentNote =
+            (question.trim().isNotEmpty &&
+                question.trim().toLowerCase() != 'haa' &&
+                question.trim().toLowerCase() != 'sax')
+            ? '\nCodsiga/Su\'aasha gaarka ah ee Ardayga: "$question"\n'
+            : '';
         return '''
 $pdfNotice
 $context
 
 ARAGTIDA MACALLINKA (DEEP LESSON):
 $learningFormat
+$studentNote
 Fadlan ardayga si faahfaahsan, hufan oo xiiso leh ugu dhig casharka/qaybta "$scopeName":
 1. Ku bilow horudhac gaaban oo soo jiidasho leh.
 2. Qodob-qodob oo tallaabo-tallaabo ah u sharax fikradaha ugu muhiimsan ee ku yaal bogaggaas.
 3. Haddii ay casharkan ku jiraan jaantusyo (diagrams), sawirro ama shaxanno ku yaal PDF-ka, si cad u sharax qaybahooda iyo waxa ay muujinayaan.
 4. Bixi ugu yaraan 1 tusaale oo la taaban karo oo nolosha dhabta ah ama deegaanka Soomaaliya ku saabsan.
 5. Ku soo xir su'aal furan ama layli kooban oo ardaygu kaga fikiro casharka.
-6. Haddii PDF-ka lifaaqa ah leeyahay sawir ama diagram waxbarasho oo muhiim ah, geli calaamaddan si sax ah isla markiiba ka dib faqradda sawirkaas sharxaysa: `[[LEYLI_VISUAL page=1; x=0.10; y=0.20; width=0.80; height=0.45; title=Magaca sawirka]]`. `page` waa bogga PDF-ka lifaaqa (bogga koowaad waa 1); x, y, width iyo height waa meelaha sawirka ee u dhexeeya 0 iyo 1. Ku dar ugu badnaan 2 calaamadood, oo keliya marka sawirku/diagram-ku casharka sharxayo. Ha ku darin calaamaddan haddii aan sawir waxbarasho jirin.
 ''';
 
       case TutorMode.visuals:
@@ -423,13 +804,8 @@ Fadlan soo koob dhammaan qodobada ugu muhiimsan ee qaybta "$scopeName".
 $pdfNotice
 $context
 
-Su'aasha Ardayga: $question
-
-Tilmaamaha Macallinka Leyli AI:
-- U sharax ardayga su'aashiisa si faahfaahsan, qoto-dheer oo aad u cad.
-- Si toos ah u tixraac bogagga PDF-ka la jaray ee qaybta "$scopeName": qoraalka, sawirrada, jaantusyada (diagrams), shaxannada, qaacidooyinka iyo tusaalooyinka ku jira.
-- Haddii ardaygu weydiiyo su'aal gaar ah oo ku saabsan qaybta hadda, uga jawaab su'aasha si toos ah; ha ku celin casharka oo dhan. Adeegso casharkii hore ee session-kan kaliya si aad ugu xirto jawaabta.
-$learningFormat
+Fariinta ardayga: $question
+Wada-hadalkii dhowaa iyo xogta buugga kore u adeegso marka ay su'aasha khuseeyaan. Jawaab fariinta ardayga si dabiici ah oo toos ah; sharax xogta PDF-ka marka codsigu u baahan yahay.
 ''';
     }
   }
@@ -544,8 +920,13 @@ Haddii ardaygu doortay lesson ama section, u adeegso qaab laba-luqadood ah: Engl
     required String apiKey,
     required String systemPrompt,
     required String userPrompt,
+    String? baseUrl,
     Uint8List? pdfBytes,
     CancellationToken? cancellationToken,
+    AgentToolExecutor? toolExecutor,
+    AgentToolCallObserver? onToolCall,
+    AgentModelCallObserver? onModelCall,
+    AgentTurnContext? turnContext,
   }) async {
     if (cancellationToken?.isCancelled == true) {
       throw const GeminiCancelledException();
@@ -569,63 +950,493 @@ Haddii ardaygu doortay lesson ama section, u adeegso qaab laba-luqadood ah: Engl
 
       parts.add({'text': userPrompt});
 
-      final response = await client
-          .post(
-            Uri.parse(
-              'https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent',
-            ),
-            headers: {
-              'Content-Type': 'application/json',
-              'x-goog-api-key': apiKey,
+      var base = baseUrl?.trim();
+      if (base == null || base.isEmpty) {
+        base = 'https://generativelanguage.googleapis.com';
+      }
+      if (base.endsWith('/')) {
+        base = base.substring(0, base.length - 1);
+      }
+
+      final contents =
+          (turnContext != null && turnContext.geminiContents.isNotEmpty)
+          ? List<Map<String, dynamic>>.from(turnContext.geminiContents)
+          : <Map<String, dynamic>>[
+              {'role': 'user', 'parts': parts},
+            ];
+
+      for (var turn = 0; turn < 5; turn++) {
+        if (cancellationToken?.isCancelled == true) {
+          throw const GeminiCancelledException();
+        }
+        final request = <String, dynamic>{
+          'systemInstruction': {
+            'parts': [
+              {'text': systemPrompt},
+            ],
+          },
+          'contents': contents,
+          if (toolExecutor != null) ...{
+            'tools': [
+              {'functionDeclarations': _geminiAgentToolDeclarations},
+            ],
+            'toolConfig': {
+              'functionCallingConfig': {'mode': 'AUTO'},
             },
-            body: jsonEncode({
-              'systemInstruction': {
-                'parts': [
-                  {'text': systemPrompt},
-                ],
-              },
-              'contents': [
-                {'role': 'user', 'parts': parts},
-              ],
-            }),
-          )
-          .timeout(const Duration(minutes: 10));
+          },
+        };
+        final modelStopwatch = Stopwatch()..start();
+        http.Response response;
+        try {
+          if (SupabaseConfig.isInitialized) {
+            final models = await const AiModelStorage().getModels();
+            AiModelConfig? configuredModel;
+            for (final candidate in models) {
+              if (candidate.modelId == model &&
+                  candidate.isActive &&
+                  candidate.isVerified &&
+                  !candidate.isOpenAiCompatible) {
+                configuredModel = candidate;
+                break;
+              }
+            }
+            if (configuredModel == null) {
+              throw GeminiBookChatException(
+                'Model-ka $model kama jiro dejinta AI Manage ee cloud-ka.',
+              );
+            }
+            response = await const AiGatewayClient()
+                .generate(
+                  modelId: configuredModel.id,
+                  operation: 'chat',
+                  body: request,
+                )
+                .timeout(defaultRequestTimeout);
+          } else {
+            response = await client
+                .post(
+                  Uri.parse('$base/v1beta/models/$model:generateContent'),
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': apiKey,
+                  },
+                  body: jsonEncode(request),
+                )
+                .timeout(defaultRequestTimeout);
+          }
+        } catch (postErr) {
+          modelStopwatch.stop();
+          onModelCall?.call(
+            AgentModelCallLog(
+              stepIndex: turn + 1,
+              callType: turn == 0
+                  ? 'Codsiga 1aad ee Model-ka (Initial Analysis)'
+                  : 'Codsiga ${turn + 1}aad ee Model-ka',
+              latencyMs: modelStopwatch.elapsedMilliseconds,
+              isSuccess: false,
+              modelName: model,
+              errorMessage: postErr.toString(),
+              timestamp: DateTime.now(),
+            ),
+          );
+          if (isTimeoutError(postErr)) {
+            throw const GeminiTimeoutException();
+          }
+          rethrow;
+        }
+        modelStopwatch.stop();
+        final modelLatencyMs = modelStopwatch.elapsedMilliseconds;
 
-      if (cancellationToken?.isCancelled == true) {
-        throw const GeminiCancelledException();
-      }
+        if (cancellationToken?.isCancelled == true) {
+          throw const GeminiCancelledException();
+        }
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          String errDetail = response.body;
+          try {
+            final errJson = jsonDecode(response.body) as Map<String, dynamic>;
+            errDetail =
+                errJson['error']?['message']?.toString() ?? response.body;
+          } catch (_) {}
+          onModelCall?.call(
+            AgentModelCallLog(
+              stepIndex: turn + 1,
+              callType: 'Codsiga ${turn + 1}aad ee Model-ka ($model)',
+              latencyMs: modelLatencyMs,
+              isSuccess: false,
+              modelName: model,
+              errorMessage: 'HTTP ${response.statusCode}: $errDetail',
+              timestamp: DateTime.now(),
+            ),
+          );
+          if (response.statusCode == 503 ||
+              errDetail.toLowerCase().contains('high demand') ||
+              errDetail.toLowerCase().contains('overloaded')) {
+            throw const GeminiModelBusyException(
+              'Model-ku hadda wuu mashquulsan yahay (503 High Demand / Ciriiri).',
+              statusCode: 503,
+            );
+          }
+          if (response.statusCode == 429 ||
+              errDetail.toLowerCase().contains('resource_exhausted') ||
+              errDetail.toLowerCase().contains('quota')) {
+            throw const GeminiModelBusyException(
+              'Model-ku wuxuu gaaray xadka codsiyada (429 Rate Limit / Quota Exceeded).',
+              statusCode: 429,
+            );
+          }
+          if (response.statusCode == 404) {
+            throw GeminiBookChatException(
+              'Model-ka lama helin (404 Not Found): "$model". Fadlan hubi magaca saxda ah ee Google Model-ka.',
+            );
+          }
+          throw GeminiBookChatException(
+            'API Khalad (${response.statusCode}): $errDetail',
+          );
+        }
 
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw GeminiBookChatException(
-          'API Status ${response.statusCode}: ${response.body}',
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final candidates = data['candidates'] as List<dynamic>?;
+        final firstCandidate = candidates?.isNotEmpty == true
+            ? candidates!.first as Map<String, dynamic>?
+            : null;
+        final content = firstCandidate?['content'] as Map<String, dynamic>?;
+        final resParts = content?['parts'] as List<dynamic>? ?? const [];
+        final calls = resParts
+            .whereType<Map<String, dynamic>>()
+            .map((part) => part['functionCall'])
+            .whereType<Map<String, dynamic>>()
+            .toList();
+
+        onModelCall?.call(
+          AgentModelCallLog(
+            stepIndex: turn + 1,
+            callType: calls.isNotEmpty
+                ? 'Tallaabada ${turn + 1}: Falanqaynta & Codsashada Tool-ka (${calls.map((c) => c['name']).join(', ')})'
+                : (turn == 0
+                      ? 'Tallaabada 1: Jawaabta Tooska ah ee Model-ka'
+                      : 'Tallaabada ${turn + 1}: Qorista Jawaabta Dhammaystiran'),
+            latencyMs: modelLatencyMs,
+            isSuccess: true,
+            modelName: model,
+            timestamp: DateTime.now(),
+          ),
         );
-      }
-
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final candidates = data['candidates'] as List<dynamic>?;
-      final firstCandidate = candidates?.isNotEmpty == true
-          ? candidates!.first as Map<String, dynamic>?
-          : null;
-      final content = firstCandidate?['content'] as Map<String, dynamic>?;
-      final resParts = content?['parts'] as List<dynamic>?;
-
-      final buffer = StringBuffer();
-      if (resParts != null) {
-        for (final part in resParts) {
-          if (part is Map<String, dynamic>) {
-            if (part['thought'] == true) continue;
-            final partText = part['text'] as String?;
-            if (partText != null && partText.isNotEmpty) {
-              buffer.write(partText);
+        if (calls.isNotEmpty && toolExecutor != null && content != null) {
+          contents.add(content);
+          final functionResponses = <Map<String, dynamic>>[];
+          for (final call in calls) {
+            final name = call['name'] as String? ?? '';
+            final rawArgs = call['args'];
+            final args = rawArgs is Map
+                ? rawArgs.map((key, value) => MapEntry(key.toString(), value))
+                : <String, dynamic>{};
+            final stopwatch = Stopwatch()..start();
+            Map<String, dynamic> result;
+            var succeeded = true;
+            String? errorMessage;
+            try {
+              result = await toolExecutor(name, args);
+            } catch (error) {
+              succeeded = false;
+              errorMessage = error.toString();
+              result = {'error': errorMessage};
+            }
+            stopwatch.stop();
+            final pdfBytes = result.remove('_pdfBytes');
+            onToolCall?.call(
+              AgentToolCallLog(
+                toolId: name,
+                toolName: name,
+                arguments: args,
+                outputSummary: succeeded
+                    ? (result['summary']?.toString() ?? 'Tool completed')
+                    : 'Tool failed',
+                rawOutput: _traceSafeToolOutput(result),
+                latencyMs: stopwatch.elapsedMilliseconds,
+                isSuccess: succeeded,
+                errorMessage: errorMessage,
+                timestamp: DateTime.now(),
+              ),
+            );
+            functionResponses.add({
+              'functionResponse': {'name': name, 'response': result},
+            });
+            if (pdfBytes is Uint8List && pdfBytes.isNotEmpty) {
+              turnContext?.discoveredPdfBytes = pdfBytes;
+              functionResponses.add({
+                'inline_data': {
+                  'mime_type': 'application/pdf',
+                  'data': base64Encode(pdfBytes),
+                },
+              });
             }
           }
+          contents.add({'role': 'user', 'parts': functionResponses});
+          turnContext?.geminiContents = List<Map<String, dynamic>>.from(
+            contents,
+          );
+          continue;
         }
+
+        final buffer = StringBuffer();
+        for (final part in resParts.whereType<Map<String, dynamic>>()) {
+          if (part['thought'] == true) continue;
+          final partText = part['text'] as String?;
+          if (partText != null && partText.isNotEmpty) buffer.write(partText);
+        }
+        final text = buffer.toString().trim();
+        if (text.isEmpty) {
+          throw const GeminiBookChatException(
+            'Jawaab madhan ayaa soo noqotay.',
+          );
+        }
+        return text;
       }
-      final text = buffer.toString().trim();
-      if (text.isEmpty) {
-        throw const GeminiBookChatException('Jawaab madhan ayaa soo noqotay.');
+      throw const GeminiBookChatException(
+        'Tool-ku wuxuu dhaafay tirada isku-dayada la oggol yahay.',
+      );
+    } finally {
+      if (shouldClose) {
+        client.close();
       }
-      return text;
+    }
+  }
+
+  Future<String> _callOpenAiCompatibleApi({
+    required AiModelConfig config,
+    required String systemPrompt,
+    required String userPrompt,
+    CancellationToken? cancellationToken,
+    AgentToolExecutor? toolExecutor,
+    AgentToolCallObserver? onToolCall,
+    AgentModelCallObserver? onModelCall,
+    AgentTurnContext? turnContext,
+  }) async {
+    if (cancellationToken?.isCancelled == true) {
+      throw const GeminiCancelledException();
+    }
+    final apiKey = SupabaseConfig.isInitialized
+        ? ''
+        : await const AiApiKeyResolver().resolve(
+            model: config,
+            provider: config.company,
+          );
+    final client = _customClient ?? http.Client();
+    final shouldClose = _customClient == null;
+    cancellationToken?.attachClient(client);
+
+    try {
+      var baseUrl = config.baseUrl.trim();
+      if (baseUrl.endsWith('/')) {
+        baseUrl = baseUrl.substring(0, baseUrl.length - 1);
+      }
+      final chatUrl = baseUrl.endsWith('/chat/completions')
+          ? baseUrl
+          : '$baseUrl/chat/completions';
+
+      final messages =
+          (turnContext != null && turnContext.openAiMessages.isNotEmpty)
+          ? List<Map<String, dynamic>>.from(turnContext.openAiMessages)
+          : <Map<String, dynamic>>[
+              {'role': 'system', 'content': systemPrompt},
+              {'role': 'user', 'content': userPrompt},
+            ];
+      for (var turn = 0; turn < 5; turn++) {
+        if (cancellationToken?.isCancelled == true) {
+          throw const GeminiCancelledException();
+        }
+        final request = <String, dynamic>{
+          'model': config.modelId,
+          'messages': messages,
+          if (toolExecutor != null) ...{
+            'tools': _openAiAgentToolDeclarations,
+            'tool_choice': 'auto',
+          },
+        };
+        final modelStopwatch = Stopwatch()..start();
+        http.Response response;
+        try {
+          if (SupabaseConfig.isInitialized) {
+            response = await const AiGatewayClient()
+                .generate(modelId: config.id, operation: 'chat', body: request)
+                .timeout(defaultRequestTimeout);
+          } else {
+            response = await client
+                .post(
+                  Uri.parse(chatUrl),
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer $apiKey',
+                  },
+                  body: jsonEncode(request),
+                )
+                .timeout(defaultRequestTimeout);
+          }
+        } catch (postErr) {
+          modelStopwatch.stop();
+          onModelCall?.call(
+            AgentModelCallLog(
+              stepIndex: turn + 1,
+              callType: turn == 0
+                  ? 'Codsiga 1aad ee Model-ka (Initial Analysis)'
+                  : 'Codsiga ${turn + 1}aad ee Model-ka',
+              latencyMs: modelStopwatch.elapsedMilliseconds,
+              isSuccess: false,
+              modelName: config.displayName,
+              errorMessage: postErr.toString(),
+              timestamp: DateTime.now(),
+            ),
+          );
+          if (isTimeoutError(postErr)) {
+            throw const GeminiTimeoutException();
+          }
+          rethrow;
+        }
+        modelStopwatch.stop();
+        final modelLatencyMs = modelStopwatch.elapsedMilliseconds;
+
+        if (cancellationToken?.isCancelled == true) {
+          throw const GeminiCancelledException();
+        }
+
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          String errDetail = response.body;
+          try {
+            final errJson = jsonDecode(response.body) as Map<String, dynamic>;
+            errDetail =
+                errJson['error']?['message']?.toString() ?? response.body;
+          } catch (_) {}
+          onModelCall?.call(
+            AgentModelCallLog(
+              stepIndex: turn + 1,
+              callType:
+                  'Codsiga ${turn + 1}aad ee Model-ka (${config.displayName})',
+              latencyMs: modelLatencyMs,
+              isSuccess: false,
+              modelName: config.displayName,
+              errorMessage: 'HTTP ${response.statusCode}: $errDetail',
+              timestamp: DateTime.now(),
+            ),
+          );
+          if (response.statusCode == 401) {
+            throw GeminiBookChatException(
+              'API Key-ga lama aqbalin (401 Unauthorized). Fadlan hubi furahaaga ${config.company}.',
+            );
+          }
+          if (response.statusCode == 503 ||
+              errDetail.toLowerCase().contains('overloaded') ||
+              errDetail.toLowerCase().contains('high demand')) {
+            throw GeminiModelBusyException(
+              'Model-ka ${config.displayName} hadda wuu mashquulsan yahay (503 High Demand / Ciriiri).',
+              statusCode: 503,
+            );
+          }
+          if (response.statusCode == 429 ||
+              errDetail.toLowerCase().contains('rate limit') ||
+              errDetail.toLowerCase().contains('insufficient_quota') ||
+              errDetail.toLowerCase().contains('quota')) {
+            throw GeminiModelBusyException(
+              'Model-ka ${config.displayName} wuxuu gaaray xadka codsiyada (429 Rate Limit / Quota).',
+              statusCode: 429,
+            );
+          }
+          if (response.statusCode == 404) {
+            throw GeminiBookChatException(
+              'Model-ka lama helin (404 Not Found): "${config.modelId}". Hubi magaca saxda ah.',
+            );
+          }
+          throw GeminiBookChatException(
+            'API Khalad (${response.statusCode}): $errDetail',
+          );
+        }
+
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final choices = data['choices'] as List<dynamic>?;
+        final first = choices?.isNotEmpty == true
+            ? choices!.first as Map<String, dynamic>?
+            : null;
+        final message = first?['message'] as Map<String, dynamic>?;
+        final toolCalls = message?['tool_calls'] as List<dynamic>? ?? const [];
+
+        onModelCall?.call(
+          AgentModelCallLog(
+            stepIndex: turn + 1,
+            callType: toolCalls.isNotEmpty
+                ? 'Tallaabada ${turn + 1}: Falanqaynta & Codsashada Tool-ka (${toolCalls.length} calls)'
+                : (turn == 0
+                      ? 'Tallaabada 1: Jawaabta Tooska ah ee Model-ka'
+                      : 'Tallaabada ${turn + 1}: Qorista Jawaabta Dhammaystiran'),
+            latencyMs: modelLatencyMs,
+            isSuccess: true,
+            modelName: config.displayName,
+            timestamp: DateTime.now(),
+          ),
+        );
+        if (toolCalls.isNotEmpty && toolExecutor != null && message != null) {
+          messages.add(message);
+          for (final item in toolCalls.whereType<Map<String, dynamic>>()) {
+            final call = item['function'] as Map<String, dynamic>? ?? const {};
+            final name = call['name'] as String? ?? '';
+            Map<String, dynamic> args = {};
+            try {
+              final parsed = jsonDecode(call['arguments'] as String? ?? '{}');
+              if (parsed is Map) {
+                args = parsed.map(
+                  (key, value) => MapEntry(key.toString(), value),
+                );
+              }
+            } catch (_) {}
+            final stopwatch = Stopwatch()..start();
+            Map<String, dynamic> result;
+            var succeeded = true;
+            String? errorMessage;
+            try {
+              result = await toolExecutor(name, args);
+            } catch (error) {
+              succeeded = false;
+              errorMessage = error.toString();
+              result = {'error': errorMessage};
+            }
+            stopwatch.stop();
+            result.remove('_pdfBytes');
+            onToolCall?.call(
+              AgentToolCallLog(
+                toolId: name,
+                toolName: name,
+                arguments: args,
+                outputSummary: succeeded
+                    ? (result['summary']?.toString() ?? 'Tool completed')
+                    : 'Tool failed',
+                rawOutput: _traceSafeToolOutput(result),
+                latencyMs: stopwatch.elapsedMilliseconds,
+                isSuccess: succeeded,
+                errorMessage: errorMessage,
+                timestamp: DateTime.now(),
+              ),
+            );
+            messages.add({
+              'role': 'tool',
+              'tool_call_id': item['id'],
+              'name': name,
+              'content': jsonEncode(result),
+            });
+          }
+          turnContext?.openAiMessages = List<Map<String, dynamic>>.from(
+            messages,
+          );
+          continue;
+        }
+        final content = message?['content'] as String?;
+        if (content == null || content.trim().isEmpty) {
+          throw const GeminiBookChatException(
+            'Jawaab madhan ayaa soo noqotay.',
+          );
+        }
+        return content.trim();
+      }
+      throw const GeminiBookChatException(
+        'Tool-ku wuxuu dhaafay tirada isku-dayada la oggol yahay.',
+      );
     } finally {
       if (shouldClose) {
         client.close();
@@ -930,6 +1741,11 @@ class GeminiBookChatException implements Exception {
   String toString() => message;
 }
 
+class GeminiModelBusyException extends GeminiBookChatException {
+  const GeminiModelBusyException(super.message, {this.statusCode});
+  final int? statusCode;
+}
+
 class GeminiCancelledException implements Exception {
   const GeminiCancelledException([this.message = 'Shaqada waa la joojiyay']);
   final String message;
@@ -954,4 +1770,27 @@ class CancellationToken {
       _activeClient?.close();
     } catch (_) {}
   }
+}
+
+class GeminiTimeoutException extends GeminiBookChatException {
+  const GeminiTimeoutException([
+    super.message =
+        '⚠️ Waqtigii jawaabta ayaa dhacay (Timeout ka badan 3 daqiiqo). Model-ku wuu raagay ama culeys ayaa jira.',
+  ]);
+}
+
+class AgentTurnContext {
+  AgentTurnContext({
+    List<Map<String, dynamic>>? geminiContents,
+    List<Map<String, dynamic>>? openAiMessages,
+    this.discoveredPdfBytes,
+  }) : geminiContents = geminiContents ?? [],
+       openAiMessages = openAiMessages ?? [];
+
+  List<Map<String, dynamic>> geminiContents;
+  List<Map<String, dynamic>> openAiMessages;
+  Uint8List? discoveredPdfBytes;
+
+  bool get hasPriorTurnHistory =>
+      geminiContents.length > 1 || openAiMessages.length > 2;
 }

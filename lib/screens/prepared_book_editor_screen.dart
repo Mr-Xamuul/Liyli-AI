@@ -1,15 +1,13 @@
 import 'dart:async';
+import 'dart:math' as math;
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
 import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
 
 import '../models/prepared_book.dart';
-import '../models/book_knowledge.dart';
 import 'book_chat_screen.dart';
-import '../services/book_knowledge_storage.dart';
 import '../services/prepared_book_storage.dart';
 
 /// Admin-only editor. It stores one original PDF and non-destructive page markers.
@@ -18,13 +16,25 @@ class PreparedBookEditorScreen extends StatefulWidget {
     super.key,
     this.storage,
     this.initialBook,
+    this.initialTabIndex = 0,
+    this.returnToPreview = false,
+    this.initialChapterIndex,
+    this.initialLessonIndex,
+    this.initialSectionIndex,
     this.onOpenChat,
     this.onOpenLibrary,
     this.onBackToChat,
+    this.onBackToAdmin,
+    this.onGoToPreview,
   });
 
   final PreparedBookStorage? storage;
   final PreparedBook? initialBook;
+  final int initialTabIndex;
+  final bool returnToPreview;
+  final int? initialChapterIndex;
+  final int? initialLessonIndex;
+  final int? initialSectionIndex;
   final void Function(
     PreparedBook book, {
     String? chapter,
@@ -34,6 +44,8 @@ class PreparedBookEditorScreen extends StatefulWidget {
   onOpenChat;
   final VoidCallback? onOpenLibrary;
   final VoidCallback? onBackToChat;
+  final VoidCallback? onBackToAdmin;
+  final void Function(PreparedBook book)? onGoToPreview;
 
   @override
   State<PreparedBookEditorScreen> createState() =>
@@ -42,7 +54,6 @@ class PreparedBookEditorScreen extends StatefulWidget {
 
 class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
   final _storage = const PreparedBookStorage();
-  final _knowledgeStorage = const BookKnowledgeStorage();
   final _pdfController = PdfViewerController();
   PreparedBook? _book;
   Uint8List? _pdfBytes;
@@ -63,9 +74,10 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
   double _markerEndPosition = .75;
   String _activeMarker = 'start';
   final Map<int, double> _pdfPageHeights = {};
+  final Map<int, double> _pdfPageWidths = {};
   String? _message;
-  String? _selectedPdfText;
   Timer? _autoSaveTimer;
+  bool _showThumbnails = true;
 
   PreparedBookStorage get _bookStorage => widget.storage ?? _storage;
 
@@ -131,6 +143,27 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
       }
       return;
     }
+    try {
+      final doc = PdfDocument(inputBytes: bytes);
+      final count = doc.pages.count;
+      _pdfPageHeights
+        ..clear()
+        ..addEntries(
+          List.generate(
+            count,
+            (i) => MapEntry(i + 1, doc.pages[i].size.height),
+          ),
+        );
+      _pdfPageWidths
+        ..clear()
+        ..addEntries(
+          List.generate(
+            count,
+            (i) => MapEntry(i + 1, doc.pages[i].size.width),
+          ),
+        );
+      doc.dispose();
+    } catch (_) {}
     if (!mounted) return;
     setState(() {
       _book = book;
@@ -138,83 +171,6 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
       _message =
           'Book-ga waa la furay. Wax ka beddel ama sii wad diyaarintiisa.';
     });
-  }
-
-  Future<void> _deleteSavedBook(PreparedBook book) async {
-    await _bookStorage.delete(book);
-    if (!mounted) return;
-    setState(() {
-      _savedBooks = _savedBooks.where((item) => item.id != book.id).toList();
-      if (_book?.id == book.id) {
-        _book = null;
-        _pdfBytes = null;
-      }
-      _message = 'Book-ga local-ka waa la tirtiray.';
-    });
-  }
-
-  Future<void> _choosePdf() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['pdf'],
-      allowMultiple: false,
-      withData: true,
-    );
-    if (result == null) return;
-    final file = result.files.single;
-    final bytes = file.bytes;
-    if (bytes == null || bytes.isEmpty) {
-      setState(() => _message = 'PDF-ga lama akhrin karin.');
-      return;
-    }
-
-    int pageCount;
-    final pageTexts = <int, String>{};
-    try {
-      final document = PdfDocument(inputBytes: bytes);
-      pageCount = document.pages.count;
-      _pdfPageHeights
-        ..clear()
-        ..addEntries(
-          List.generate(
-            pageCount,
-            (index) => MapEntry(
-              index + 1,
-              document.pages[index].getClientSize().height,
-            ),
-          ),
-        );
-      for (var index = 0; index < pageCount; index++) {
-        pageTexts[index + 1] = PdfTextExtractor(
-          document,
-        ).extractText(startPageIndex: index, endPageIndex: index);
-      }
-      document.dispose();
-    } catch (_) {
-      setState(() => _message = 'PDF-ga lama fahmi karin ama wuu dhaawacmay.');
-      return;
-    }
-
-    final id = DateTime.now().microsecondsSinceEpoch.toString();
-    final now = DateTime.now();
-    setState(() {
-      _pdfBytes = Uint8List.fromList(bytes);
-      _book = PreparedBook(
-        id: id,
-        title: file.name.replaceFirst(
-          RegExp(r'\.pdf$', caseSensitive: false),
-          '',
-        ),
-        originalFileName: file.name,
-        pageCount: pageCount,
-        chapters: const [],
-        createdAt: now,
-        updatedAt: now,
-      );
-      _message = 'PDF-ga waa diyaar. Calaamadee qaybaha bogagga.';
-    });
-    await _knowledgeStorage.save(BookKnowledge(bookId: id, pages: pageTexts));
-    _scheduleAutoSave();
   }
 
   Future<void> _saveDraft() async {
@@ -372,6 +328,84 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
     }
   }
 
+  Future<void> _sendToPreview() async {
+    final book = _book;
+    final bytes = _pdfBytes;
+    if (book == null || bytes == null || bytes.isEmpty) return;
+
+    if (book.chapters.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Fadlan marka hore ku dar ugu yaraan hal cutub ka hor inta aan Preview loo gudbin.'),
+          backgroundColor: Color(0xFFDC2626),
+        ),
+      );
+      return;
+    }
+
+    try {
+      final path = await _bookStorage.savePdf(book.id, bytes);
+      final saved = book.copyWith(
+        originalPdfPath: path,
+        status: PreparedBookStatus.review,
+        updatedAt: DateTime.now(),
+      );
+      await _bookStorage.save(saved);
+      if (!mounted) return;
+      setState(() => _book = saved);
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Buugga "${book.title}" waxaa loo gudbiyey Qaybta Preview (Hubinta)!'),
+          backgroundColor: const Color(0xFF16A34A),
+        ),
+      );
+
+      if (widget.onGoToPreview != null) {
+        widget.onGoToPreview!(saved);
+      } else if (widget.onBackToAdmin != null) {
+        widget.onBackToAdmin!();
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Khalad ayaa dhacay: $e'),
+            backgroundColor: const Color(0xFFDC2626),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _doneAndReturnToPreview() async {
+    final book = _book;
+    final bytes = _pdfBytes;
+    PreparedBook? finalSaved = book;
+    if (book != null && bytes != null && bytes.isNotEmpty) {
+      final path = await _bookStorage.savePdf(book.id, bytes);
+      final saved = book.copyWith(
+        originalPdfPath: path,
+        status: PreparedBookStatus.review,
+        updatedAt: DateTime.now(),
+      );
+      await _bookStorage.save(saved);
+      finalSaved = saved;
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Wax ka beddelka waa la keydiyey! Dib ugu soo noqoshada Hubinta (Preview)...'),
+        backgroundColor: Color(0xFF16A34A),
+      ),
+    );
+    if (widget.onGoToPreview != null && finalSaved != null) {
+      widget.onGoToPreview!(finalSaved);
+    } else if (widget.onBackToAdmin != null) {
+      widget.onBackToAdmin!();
+    }
+  }
+
   Future<void> _showErrors(List<String> errors) async {
     await showDialog<void>(
       context: context,
@@ -394,7 +428,7 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
     final value = await _rangeDialog(
       'Chapter cusub',
       book.pageCount,
-      initialTitle: initialTitle ?? _selectedPdfText ?? '',
+      initialTitle: initialTitle ?? '',
     );
     if (value == null) return;
     final chapter = PreparedChapter(
@@ -490,9 +524,7 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
     int? initialEnd,
     String actionLabel = 'Ku dar',
   }) async {
-    final defaultTitle = initialTitle.isNotEmpty
-        ? initialTitle
-        : (_selectedPdfText?.trim() ?? '');
+    final defaultTitle = initialTitle;
     final title = TextEditingController(text: defaultTitle);
     final start = TextEditingController(
       text: '${initialStart ?? _currentPage}',
@@ -755,6 +787,25 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
     final book = _book!;
     final chapter = book.chapters[chapterIndex];
     final chapters = [...book.chapters];
+
+    int sPage = _markerStartPage;
+    int ePage = _markerEndPage;
+    double sPos = _markerStartPosition;
+    double ePos = _markerEndPosition;
+
+    if (sPage > ePage) {
+      final tmpP = sPage;
+      sPage = ePage;
+      ePage = tmpP;
+      final tmpPos = sPos;
+      sPos = ePos;
+      ePos = tmpPos;
+    } else if (sPage == ePage && sPos > ePos) {
+      final tmpPos = sPos;
+      sPos = ePos;
+      ePos = tmpPos;
+    }
+
     if (kind == 'Lesson') {
       final existing = _markerEditing
           ? chapter.lessons[_markerLessonIndex!]
@@ -762,10 +813,10 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
       final lesson = PreparedLesson(
         id: existing?.id ?? _id('lesson'),
         title: name,
-        startPage: _markerStartPage,
-        endPage: _markerEndPage,
-        startPosition: _markerStartPosition,
-        endPosition: _markerEndPosition,
+        startPage: sPage,
+        endPage: ePage,
+        startPosition: sPos,
+        endPosition: ePos,
         sections: existing?.sections ?? const [],
       );
       final lessons = [...chapter.lessons];
@@ -792,10 +843,10 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
       final section = PreparedSection(
         id: existing?.id ?? _id('section'),
         title: name,
-        startPage: _markerStartPage,
-        endPage: _markerEndPage,
-        startPosition: _markerStartPosition,
-        endPosition: _markerEndPosition,
+        startPage: sPage,
+        endPage: ePage,
+        startPosition: sPos,
+        endPosition: ePos,
       );
       final lessons = [...chapter.lessons];
       lessons[lessonIndex] = PreparedLesson(
@@ -836,16 +887,8 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
   void _cancelMarker() => setState(() => _markerKind = null);
 
   void _leaveBook() {
-    if (_book != null) {
-      setState(() {
-        _book = null;
-        _pdfBytes = null;
-        _previewRange = null;
-        _previewMarkers = const [];
-        _markerKind = null;
-        _selectedChapterIndex = null;
-        _selectedLessonIndex = null;
-      });
+    if (widget.onBackToAdmin != null) {
+      widget.onBackToAdmin!();
       return;
     }
     if (widget.onBackToChat != null) {
@@ -856,17 +899,42 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
   }
 
   Widget _markerOverlay() => LayoutBuilder(
-    builder: (context, constraints) => IgnorePointer(
-      ignoring: false,
-      child: Stack(
-        children: [
-          if (_currentPage == _markerStartPage)
-            _draggableMarkerLine(true, constraints.maxHeight),
-          if (_currentPage == _markerEndPage)
-            _draggableMarkerLine(false, constraints.maxHeight),
-        ],
-      ),
-    ),
+    builder: (context, constraints) {
+      final pageHeight = _pdfPageHeights[_currentPage] ?? 792.0;
+      final pageWidth = _pdfPageWidths[_currentPage] ?? 612.0;
+      final double scale = math.min(
+        constraints.maxWidth / pageWidth,
+        constraints.maxHeight / pageHeight,
+      );
+      final double renderedWidth = pageWidth * scale;
+      final double renderedHeight = pageHeight * scale;
+      final double pageLeft = (constraints.maxWidth - renderedWidth) / 2;
+      final double pageTop = (constraints.maxHeight - renderedHeight) / 2;
+
+      return IgnorePointer(
+        ignoring: false,
+        child: Stack(
+          children: [
+            if (_currentPage == _markerStartPage)
+              _draggableMarkerLine(
+                isStart: true,
+                pageLeft: pageLeft,
+                pageTop: pageTop,
+                pageWidth: renderedWidth,
+                pageHeight: renderedHeight,
+              ),
+            if (_currentPage == _markerEndPage)
+              _draggableMarkerLine(
+                isStart: false,
+                pageLeft: pageLeft,
+                pageTop: pageTop,
+                pageWidth: renderedWidth,
+                pageHeight: renderedHeight,
+              ),
+          ],
+        ),
+      );
+    },
   );
 
   Widget _previewOverlay() {
@@ -882,15 +950,29 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
           return const SizedBox.shrink();
         }
 
-        final height = constraints.maxHeight;
-        final usableHeight = height - 48;
+        final pageHeight = _pdfPageHeights[page] ?? 792.0;
+        final pageWidth = _pdfPageWidths[page] ?? 612.0;
+        final double scale = math.min(
+          constraints.maxWidth / pageWidth,
+          constraints.maxHeight / pageHeight,
+        );
+        final double renderedWidth = pageWidth * scale;
+        final double renderedHeight = pageHeight * scale;
+        final double pageLeft = (constraints.maxWidth - renderedWidth) / 2;
+        final double pageTop = (constraints.maxHeight - renderedHeight) / 2;
 
         return IgnorePointer(
           child: Stack(
             children: [
               for (final marker in _previewMarkers)
                 if (page >= marker.startPage && page <= marker.endPage)
-                  _previewMarkerRangeOverlay(marker, usableHeight, height),
+                  _previewMarkerRangeOverlay(
+                    marker,
+                    pageLeft,
+                    pageTop,
+                    renderedWidth,
+                    renderedHeight,
+                  ),
             ],
           ),
         );
@@ -900,38 +982,46 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
 
   Widget _previewMarkerRangeOverlay(
     _PreviewMarkerRange marker,
-    double usableHeight,
-    double height,
+    double pageLeft,
+    double pageTop,
+    double pageWidth,
+    double pageHeight,
   ) {
     final page = _currentPage;
     final isStartPage = page == marker.startPage;
     final isEndPage = page == marker.endPage;
-    final top = isStartPage ? usableHeight * marker.startPosition : 0.0;
-    final bottom = isEndPage ? usableHeight * marker.endPosition + 3 : height;
+    final top = isStartPage ? pageTop + pageHeight * marker.startPosition : pageTop;
+    final bottom = isEndPage ? pageTop + pageHeight * marker.endPosition : pageTop + pageHeight;
     final shadeHeight = bottom > top ? bottom - top : 0.0;
     return Stack(
       children: [
         if (shadeHeight > 0)
           Positioned(
-            left: 0,
-            right: 0,
+            left: pageLeft,
+            width: pageWidth,
             top: top,
             height: shadeHeight,
-            child: ColoredBox(color: marker.color.withValues(alpha: .05)),
+            child: ColoredBox(color: marker.color.withValues(alpha: .08)),
           ),
         if (isStartPage)
           _previewMarkerLine(
             label: '${marker.title} • BILOW',
             position: marker.startPosition,
             color: marker.color,
-            height: height,
+            pageLeft: pageLeft,
+            pageTop: pageTop,
+            pageWidth: pageWidth,
+            pageHeight: pageHeight,
           ),
         if (isEndPage)
           _previewMarkerLine(
             label: '${marker.title} • DHAMMAAD',
             position: marker.endPosition,
             color: marker.color,
-            height: height,
+            pageLeft: pageLeft,
+            pageTop: pageTop,
+            pageWidth: pageWidth,
+            pageHeight: pageHeight,
           ),
       ],
     );
@@ -941,35 +1031,37 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
     required String label,
     required double position,
     required Color color,
-    required double height,
+    required double pageLeft,
+    required double pageTop,
+    required double pageWidth,
+    required double pageHeight,
   }) {
+    final lineY = pageTop + (pageHeight * position).clamp(0.0, pageHeight);
     return Positioned(
-      top: (height - 48) * position,
-      left: 0,
-      right: 0,
-      child: SizedBox(
-        height: 48,
-        child: Align(
-          alignment: Alignment.topCenter,
-          child: Container(
-            height: 3,
-            color: color,
-            child: Align(
-              alignment: Alignment.topLeft,
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  color: color,
-                  borderRadius: BorderRadius.circular(4),
+      top: lineY - 14,
+      left: pageLeft,
+      width: pageWidth,
+      height: 28,
+      child: Align(
+        alignment: Alignment.center,
+        child: Container(
+          height: 2.5,
+          color: color,
+          child: Align(
+            alignment: Alignment.topLeft,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: color,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 8,
+                  vertical: 3,
                 ),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 4,
-                  ),
-                  child: Text(
-                    label,
-                    style: const TextStyle(color: Colors.white, fontSize: 11),
-                  ),
+                child: Text(
+                  label,
+                  style: const TextStyle(color: Colors.white, fontSize: 10.5, fontWeight: FontWeight.bold),
                 ),
               ),
             ),
@@ -979,21 +1071,42 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
     );
   }
 
-  Widget _draggableMarkerLine(bool isStart, double height) {
+  Widget _draggableMarkerLine({
+    required bool isStart,
+    required double pageLeft,
+    required double pageTop,
+    required double pageWidth,
+    required double pageHeight,
+  }) {
     final position = isStart ? _markerStartPosition : _markerEndPosition;
+    final isActive = isStart ? (_activeMarker == 'start') : (_activeMarker == 'end');
+    final color = isStart ? const Color(0xFF0022FF) : const Color(0xFFD97706);
+    final label = isStart ? 'BILOW' : 'DHAMMAAD';
+    final lineY = pageTop + (pageHeight * position).clamp(0.0, pageHeight);
+
     return Positioned(
-      top: (height - 48) * position,
-      left: 0,
-      right: 0,
+      top: lineY - 18,
+      left: pageLeft,
+      width: pageWidth,
+      height: 38,
       child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () {
+          setState(() {
+            _activeMarker = isStart ? 'start' : 'end';
+            _message = isStart
+                ? 'Line-ka Bilowga (Kore) ayaa la doortay. Taabo bogga ama jiid si aad u beddesho.'
+                : 'Line-ka Dhammaadka (Hoose) ayaa la doortay. Taabo bogga ama jiid si aad u beddesho.';
+          });
+        },
+        onVerticalDragStart: (_) {
+          setState(() {
+            _activeMarker = isStart ? 'start' : 'end';
+          });
+        },
         onVerticalDragUpdate: (details) {
           final current = isStart ? _markerStartPosition : _markerEndPosition;
-          final minimum = isStart ? .02 : _markerStartPosition + .04;
-          final maximum = isStart ? _markerEndPosition - .04 : .98;
-          final next = (current + details.delta.dy / height).clamp(
-            minimum,
-            maximum,
-          );
+          final next = (current + details.delta.dy / pageHeight).clamp(0.01, 0.99);
           setState(() {
             if (isStart) {
               _markerStartPosition = next;
@@ -1004,32 +1117,79 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
           _scheduleAutoSave();
         },
         child: Container(
-          height: 48,
-          alignment: Alignment.topCenter,
-          child: Container(
-            height: 3,
-            color: isStart ? const Color(0xFF0022FF) : const Color(0xFF000000),
-            child: Align(
-              alignment: Alignment.topLeft,
-              child: DecoratedBox(
+          color: Colors.transparent,
+          alignment: Alignment.center,
+          child: Stack(
+            clipBehavior: Clip.none,
+            alignment: Alignment.center,
+            children: [
+              // Visible Horizontal Dividing Line
+              Container(
+                height: isActive ? 3.5 : 2.0,
                 decoration: BoxDecoration(
-                  color: isStart
-                      ? const Color(0xFF0022FF)
-                      : const Color(0xFF000000),
-                  borderRadius: BorderRadius.circular(4),
+                  color: color,
+                  boxShadow: isActive
+                      ? [
+                          BoxShadow(
+                            color: color.withValues(alpha: 0.6),
+                            blurRadius: 6,
+                            spreadRadius: 1,
+                          ),
+                        ]
+                      : null,
                 ),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 4,
-                  ),
-                  child: Text(
-                    isStart ? 'BILOW' : 'DHAMMAAD',
-                    style: const TextStyle(color: Colors.white, fontSize: 11),
+              ),
+              // Draggable / Interactive Badge Handle
+              Positioned(
+                left: isStart ? 12 : null,
+                right: isStart ? null : 12,
+                top: 3,
+                child: Material(
+                  elevation: isActive ? 6 : 2,
+                  borderRadius: BorderRadius.circular(6),
+                  color: color,
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(6),
+                    onTap: () {
+                      setState(() {
+                        _activeMarker = isStart ? 'start' : 'end';
+                      });
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 4,
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            isStart
+                                ? Icons.vertical_align_top_rounded
+                                : Icons.vertical_align_bottom_rounded,
+                            size: 13,
+                            color: Colors.white,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            '$label ${(position * 100).toInt()}%',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          if (isActive) ...[
+                            const SizedBox(width: 4),
+                            const Icon(Icons.check_circle, size: 11, color: Colors.white),
+                          ],
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               ),
-            ),
+            ],
           ),
         ),
       ),
@@ -1056,13 +1216,147 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
       if (_activeMarker == 'start') {
         _markerStartPage = details.pageNumber;
         _markerStartPosition = ratio;
+        // Automatically switch active marker to 'end' so the next tap sets the bottom line!
+        _activeMarker = 'end';
+        _message =
+            'Bilowga (Kore) waxaa lagu dhigay bogga ${details.pageNumber} (${(ratio * 100).toInt()}%). Hadda taabo meesha uu ku dhammaado line-ka hoose.';
       } else {
         _markerEndPage = details.pageNumber;
         _markerEndPosition = ratio;
+        _message =
+            'Dhammaadka (Hoose) waxaa lagu dhigay bogga ${details.pageNumber} (${(ratio * 100).toInt()}%).';
       }
-      _message =
-          '${_activeMarker == 'start' ? 'Bilowga' : 'Dhammaadka'} waxaa lagu dhigay bogga ${details.pageNumber}.';
     });
+    _scheduleAutoSave();
+  }
+
+  void _moveChapter(int from, int to) {
+    final book = _book;
+    if (book == null || from == to || from < 0 || to < 0 || from >= book.chapters.length || to >= book.chapters.length) return;
+    final chapters = List<PreparedChapter>.from(book.chapters);
+    final item = chapters.removeAt(from);
+    chapters.insert(to, item);
+    setState(() => _book = book.copyWith(chapters: chapters));
+    _scheduleAutoSave();
+  }
+
+  void _moveLesson(int chIdx, int from, int to) {
+    final book = _book;
+    if (book == null) return;
+    final ch = book.chapters[chIdx];
+    if (from == to || from < 0 || to < 0 || from >= ch.lessons.length || to >= ch.lessons.length) return;
+    final lessons = List<PreparedLesson>.from(ch.lessons);
+    final item = lessons.removeAt(from);
+    lessons.insert(to, item);
+    final chapters = List<PreparedChapter>.from(book.chapters);
+    chapters[chIdx] = PreparedChapter(
+      id: ch.id,
+      title: ch.title,
+      startPage: ch.startPage,
+      endPage: ch.endPage,
+      lessons: lessons,
+    );
+    setState(() => _book = book.copyWith(chapters: chapters));
+    _scheduleAutoSave();
+  }
+
+  void _moveSection(int chIdx, int lsIdx, int from, int to) {
+    final book = _book;
+    if (book == null) return;
+    final ch = book.chapters[chIdx];
+    final ls = ch.lessons[lsIdx];
+    if (from == to || from < 0 || to < 0 || from >= ls.sections.length || to >= ls.sections.length) return;
+    final sections = List<PreparedSection>.from(ls.sections);
+    final item = sections.removeAt(from);
+    sections.insert(to, item);
+    final lessons = List<PreparedLesson>.from(ch.lessons);
+    lessons[lsIdx] = PreparedLesson(
+      id: ls.id,
+      title: ls.title,
+      startPage: ls.startPage,
+      endPage: ls.endPage,
+      startPosition: ls.startPosition,
+      endPosition: ls.endPosition,
+      sections: sections,
+    );
+    final chapters = List<PreparedChapter>.from(book.chapters);
+    chapters[chIdx] = PreparedChapter(
+      id: ch.id,
+      title: ch.title,
+      startPage: ch.startPage,
+      endPage: ch.endPage,
+      lessons: lessons,
+    );
+    setState(() => _book = book.copyWith(chapters: chapters));
+    _scheduleAutoSave();
+  }
+
+  void _relocateLesson(int fromChIdx, int lsIdx, int toChIdx) {
+    if (fromChIdx == toChIdx) return;
+    final book = _book;
+    if (book == null) return;
+    final chapters = List<PreparedChapter>.from(book.chapters);
+    final fromCh = chapters[fromChIdx];
+    final toCh = chapters[toChIdx];
+    final fromLessons = List<PreparedLesson>.from(fromCh.lessons);
+    final moving = fromLessons.removeAt(lsIdx);
+    final toLessons = List<PreparedLesson>.from(toCh.lessons)..add(moving);
+    chapters[fromChIdx] = PreparedChapter(
+      id: fromCh.id,
+      title: fromCh.title,
+      startPage: fromCh.startPage,
+      endPage: fromCh.endPage,
+      lessons: fromLessons,
+    );
+    chapters[toChIdx] = PreparedChapter(
+      id: toCh.id,
+      title: toCh.title,
+      startPage: toCh.startPage,
+      endPage: toCh.endPage,
+      lessons: toLessons,
+    );
+    setState(() => _book = book.copyWith(chapters: chapters));
+    _scheduleAutoSave();
+  }
+
+  void _relocateSection(int chIdx, int fromLsIdx, int secIdx, int toLsIdx) {
+    if (fromLsIdx == toLsIdx) return;
+    final book = _book;
+    if (book == null) return;
+    final chapters = List<PreparedChapter>.from(book.chapters);
+    final ch = chapters[chIdx];
+    final lessons = List<PreparedLesson>.from(ch.lessons);
+    final fromLs = lessons[fromLsIdx];
+    final toLs = lessons[toLsIdx];
+    final fromSecs = List<PreparedSection>.from(fromLs.sections);
+    final moving = fromSecs.removeAt(secIdx);
+    final toSecs = List<PreparedSection>.from(toLs.sections)..add(moving);
+    lessons[fromLsIdx] = PreparedLesson(
+      id: fromLs.id,
+      title: fromLs.title,
+      startPage: fromLs.startPage,
+      endPage: fromLs.endPage,
+      startPosition: fromLs.startPosition,
+      endPosition: fromLs.endPosition,
+      sections: fromSecs,
+    );
+    lessons[toLsIdx] = PreparedLesson(
+      id: toLs.id,
+      title: toLs.title,
+      startPage: toLs.startPage,
+      endPage: toLs.endPage,
+      startPosition: toLs.startPosition,
+      endPosition: toLs.endPosition,
+      sections: toSecs,
+    );
+    chapters[chIdx] = PreparedChapter(
+      id: ch.id,
+      title: ch.title,
+      startPage: ch.startPage,
+      endPage: ch.endPage,
+      lessons: lessons,
+    );
+    setState(() => _book = book.copyWith(chapters: chapters));
     _scheduleAutoSave();
   }
 
@@ -1072,268 +1366,397 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
-      builder: (context) => SafeArea(
-        child: SizedBox(
-          height: MediaQuery.sizeOf(context).height * .72,
-          child: Column(
-            children: [
-              const ListTile(
-                leading: Icon(Icons.auto_stories_outlined),
-                title: Text('Chapter Cards'),
-                subtitle: Text('Dooro chapter si aad u aragto pages-kiisa.'),
-              ),
-              Expanded(
-                child: book.chapters.isEmpty
-                    ? const Center(child: Text('Weli chapter lama abuurin.'))
-                    : ListView.builder(
-                        itemCount: book.chapters.length,
-                        itemBuilder: (context, index) {
-                          final chapter = book.chapters[index];
-                          return Card(
-                            margin: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 6,
+      backgroundColor: Colors.transparent,
+      builder: (modalContext) => StatefulBuilder(
+        builder: (context, setModalState) {
+          final currentBook = _book ?? book;
+          return Container(
+            height: MediaQuery.sizeOf(context).height * .84,
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Modal Drag Handle & Header
+                Center(
+                  child: Container(
+                    margin: const EdgeInsets.only(top: 10, bottom: 6),
+                    width: 44,
+                    height: 5,
+                    decoration: BoxDecoration(
+                      color: Colors.grey.shade300,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
+                  child: Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFEFF6FF),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: const Icon(Icons.account_tree_rounded, color: Color(0xFF0022FF), size: 22),
+                      ),
+                      const SizedBox(width: 12),
+                      const Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Qaab-dhismeedka Buugga & Dib-u-habeynta',
+                              style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Color(0xFF0F172A)),
                             ),
-                            child: ExpansionTile(
-                              leading: CircleAvatar(
-                                child: Text('${index + 1}'),
+                            SizedBox(height: 2),
+                            Text(
+                              'Qayb kasta booskeeda saxda ah u wareeji (⬆️ / ⬇️) ama u wareeji cutub kale.',
+                              style: TextStyle(fontSize: 11.5, color: Color(0xFF64748B)),
+                            ),
+                          ],
+                        ),
+                      ),
+                      FilledButton.tonalIcon(
+                        onPressed: () async {
+                          await _addChapter();
+                          setModalState(() {});
+                        },
+                        icon: const Icon(Icons.add_box_outlined, size: 16),
+                        label: const Text('+ Chapter'),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(height: 1),
+
+                // Main Tree & Reordering List
+                Expanded(
+                  child: currentBook.chapters.isEmpty
+                      ? Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.menu_book_rounded, size: 48, color: Colors.grey.shade300),
+                              const SizedBox(height: 12),
+                              const Text('Weli wax cutubyo ah lama abuurin.'),
+                              const SizedBox(height: 8),
+                              FilledButton.icon(
+                                onPressed: () async {
+                                  await _addChapter();
+                                  setModalState(() {});
+                                },
+                                icon: const Icon(Icons.add),
+                                label: const Text('Abuur Cutubkii Koowaad'),
                               ),
-                              title: Text(chapter.title),
-                              subtitle: Text(
-                                'Bogagga ${chapter.startPage}–${chapter.endPage} • ${chapter.lessons.length} lessons',
+                            ],
+                          ),
+                        )
+                      : ListView.builder(
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                          itemCount: currentBook.chapters.length,
+                          itemBuilder: (context, chIdx) {
+                            final chapter = currentBook.chapters[chIdx];
+                            return Card(
+                              elevation: 0,
+                              margin: const EdgeInsets.only(bottom: 12),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14),
+                                side: BorderSide(color: Colors.grey.shade200),
                               ),
-                              trailing: Row(
-                                mainAxisSize: MainAxisSize.min,
+                              child: ExpansionTile(
+                                leading: CircleAvatar(
+                                  radius: 14,
+                                  backgroundColor: const Color(0xFF0022FF),
+                                  foregroundColor: Colors.white,
+                                  child: Text('${chIdx + 1}', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                                ),
+                                title: Text(chapter.title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5)),
+                                subtitle: Text(
+                                  'Bogagga ${chapter.startPage}–${chapter.endPage} • ${chapter.lessons.length} cashar',
+                                  style: TextStyle(fontSize: 11.5, color: Colors.grey.shade600),
+                                ),
+                                trailing: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    // Move Chapter Up
+                                    IconButton(
+                                      tooltip: 'Kor u qaad Cutubka',
+                                      icon: const Icon(Icons.arrow_upward_rounded, size: 18),
+                                      onPressed: chIdx > 0
+                                          ? () {
+                                              _moveChapter(chIdx, chIdx - 1);
+                                              setModalState(() {});
+                                            }
+                                          : null,
+                                    ),
+                                    // Move Chapter Down
+                                    IconButton(
+                                      tooltip: 'Hoos u dhig Cutubka',
+                                      icon: const Icon(Icons.arrow_downward_rounded, size: 18),
+                                      onPressed: chIdx < currentBook.chapters.length - 1
+                                          ? () {
+                                              _moveChapter(chIdx, chIdx + 1);
+                                              setModalState(() {});
+                                            }
+                                          : null,
+                                    ),
+                                    IconButton(
+                                      tooltip: 'Wax ka beddel',
+                                      icon: const Icon(Icons.edit_outlined, size: 18),
+                                      onPressed: () async {
+                                        await _editChapter(chIdx);
+                                        setModalState(() {});
+                                      },
+                                    ),
+                                    IconButton(
+                                      tooltip: 'Tirtir',
+                                      icon: const Icon(Icons.delete_outline, size: 18, color: Colors.red),
+                                      onPressed: () {
+                                        _deleteChapter(chIdx);
+                                        setModalState(() {});
+                                      },
+                                    ),
+                                  ],
+                                ),
                                 children: [
-                                  IconButton(
-                                    tooltip: 'Wax ka beddel Chapter',
-                                    onPressed: () {
-                                      Navigator.pop(context);
-                                      _editChapter(index);
-                                    },
-                                    icon: const Icon(Icons.edit_outlined),
+                                  // Add Lesson Button
+                                  Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                                    child: Align(
+                                      alignment: Alignment.centerLeft,
+                                      child: TextButton.icon(
+                                        onPressed: () {
+                                          Navigator.pop(modalContext);
+                                          _beginMarker(kind: 'Lesson', chapterIndex: chIdx);
+                                        },
+                                        icon: const Icon(Icons.add, size: 15),
+                                        label: const Text('+ Ku dar Cashar cutubkan'),
+                                      ),
+                                    ),
                                   ),
-                                  IconButton(
-                                    tooltip: 'Tirtir Chapter',
-                                    onPressed: () {
-                                      Navigator.pop(context);
-                                      _deleteChapter(index);
-                                    },
-                                    icon: const Icon(Icons.delete_outline),
-                                  ),
+                                  // Lesson items
+                                  for (int lsIdx = 0; lsIdx < chapter.lessons.length; lsIdx++) ...[
+                                    Builder(
+                                      builder: (context) {
+                                        final lesson = chapter.lessons[lsIdx];
+                                        return Padding(
+                                          padding: const EdgeInsets.only(left: 20, right: 12, bottom: 6),
+                                          child: Card(
+                                            color: const Color(0xFFF8FAFC),
+                                            elevation: 0,
+                                            shape: RoundedRectangleBorder(
+                                              borderRadius: BorderRadius.circular(10),
+                                              side: BorderSide(color: Colors.grey.shade200),
+                                            ),
+                                            child: ExpansionTile(
+                                              leading: const Icon(Icons.menu_book_rounded, size: 18, color: Color(0xFF16A34A)),
+                                              title: Text(lesson.title, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 12.5)),
+                                              subtitle: Text(
+                                                'p.${lesson.startPage}-${lesson.endPage} • ${lesson.sections.length} qaybood',
+                                                style: const TextStyle(fontSize: 10.5),
+                                              ),
+                                              trailing: Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  // Move Lesson Up
+                                                  IconButton(
+                                                    tooltip: 'Kor u qaad Casharka',
+                                                    icon: const Icon(Icons.arrow_upward_rounded, size: 16),
+                                                    onPressed: lsIdx > 0
+                                                        ? () {
+                                                            _moveLesson(chIdx, lsIdx, lsIdx - 1);
+                                                            setModalState(() {});
+                                                          }
+                                                        : null,
+                                                  ),
+                                                  // Move Lesson Down
+                                                  IconButton(
+                                                    tooltip: 'Hoos u dhig Casharka',
+                                                    icon: const Icon(Icons.arrow_downward_rounded, size: 16),
+                                                    onPressed: lsIdx < chapter.lessons.length - 1
+                                                        ? () {
+                                                            _moveLesson(chIdx, lsIdx, lsIdx + 1);
+                                                            setModalState(() {});
+                                                          }
+                                                        : null,
+                                                  ),
+                                                  // Relocate Lesson to another chapter
+                                                  if (currentBook.chapters.length > 1)
+                                                    PopupMenuButton<int>(
+                                                      tooltip: 'U wareeji Cutub kale',
+                                                      icon: const Icon(Icons.drive_file_move_outlined, size: 17),
+                                                      onSelected: (targetChIdx) {
+                                                        _relocateLesson(chIdx, lsIdx, targetChIdx);
+                                                        setModalState(() {});
+                                                      },
+                                                      itemBuilder: (context) => [
+                                                        for (int c = 0; c < currentBook.chapters.length; c++)
+                                                          if (c != chIdx)
+                                                            PopupMenuItem(
+                                                              value: c,
+                                                              child: Text('U wareeji: ${currentBook.chapters[c].title}'),
+                                                            ),
+                                                      ],
+                                                    ),
+                                                  IconButton(
+                                                    tooltip: 'Wax ka beddel',
+                                                    icon: const Icon(Icons.edit_outlined, size: 17),
+                                                    onPressed: () {
+                                                      Navigator.pop(modalContext);
+                                                      _beginEditMarker(
+                                                        kind: 'Lesson',
+                                                        chapterIndex: chIdx,
+                                                        lessonIndex: lsIdx,
+                                                      );
+                                                    },
+                                                  ),
+                                                  IconButton(
+                                                    tooltip: 'Tirtir',
+                                                    icon: const Icon(Icons.delete_outline, size: 17, color: Colors.red),
+                                                    onPressed: () {
+                                                      _deleteLesson(chIdx, lsIdx);
+                                                      setModalState(() {});
+                                                    },
+                                                  ),
+                                                ],
+                                              ),
+                                              children: [
+                                                // Add Section button
+                                                Padding(
+                                                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+                                                  child: Align(
+                                                    alignment: Alignment.centerLeft,
+                                                    child: TextButton.icon(
+                                                      onPressed: () {
+                                                        Navigator.pop(modalContext);
+                                                        _beginMarker(
+                                                          kind: 'Section',
+                                                          chapterIndex: chIdx,
+                                                          lessonIndex: lsIdx,
+                                                        );
+                                                      },
+                                                      icon: const Icon(Icons.add, size: 14),
+                                                      label: const Text('+ Ku dar Section casharkan'),
+                                                    ),
+                                                  ),
+                                                ),
+                                                // Section Items
+                                                for (int secIdx = 0; secIdx < lesson.sections.length; secIdx++) ...[
+                                                  Builder(
+                                                    builder: (context) {
+                                                      final section = lesson.sections[secIdx];
+                                                      return Container(
+                                                        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 3),
+                                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                                        decoration: BoxDecoration(
+                                                          color: Colors.white,
+                                                          borderRadius: BorderRadius.circular(8),
+                                                          border: Border.all(color: Colors.grey.shade200),
+                                                        ),
+                                                        child: Row(
+                                                          children: [
+                                                            const Icon(Icons.segment_rounded, size: 16, color: Color(0xFFD97706)),
+                                                            const SizedBox(width: 8),
+                                                            Expanded(
+                                                              child: Column(
+                                                                crossAxisAlignment: CrossAxisAlignment.start,
+                                                                children: [
+                                                                  Text(section.title, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                                                                  Text(
+                                                                    'p.${section.startPage}-${section.endPage} • ${(section.startPosition * 100).toInt()}%-${(section.endPosition * 100).toInt()}%',
+                                                                    style: TextStyle(fontSize: 10, color: Colors.grey.shade600),
+                                                                  ),
+                                                                ],
+                                                              ),
+                                                            ),
+                                                            // Move Section Up
+                                                            IconButton(
+                                                              tooltip: 'Kor u qaad Section-ka',
+                                                              icon: const Icon(Icons.arrow_upward_rounded, size: 15),
+                                                              onPressed: secIdx > 0
+                                                                  ? () {
+                                                                      _moveSection(chIdx, lsIdx, secIdx, secIdx - 1);
+                                                                      setModalState(() {});
+                                                                    }
+                                                                  : null,
+                                                            ),
+                                                            // Move Section Down
+                                                            IconButton(
+                                                              tooltip: 'Hoos u dhig Section-ka',
+                                                              icon: const Icon(Icons.arrow_downward_rounded, size: 15),
+                                                              onPressed: secIdx < lesson.sections.length - 1
+                                                                  ? () {
+                                                                      _moveSection(chIdx, lsIdx, secIdx, secIdx + 1);
+                                                                      setModalState(() {});
+                                                                    }
+                                                                  : null,
+                                                            ),
+                                                            // Relocate Section to another lesson
+                                                            if (chapter.lessons.length > 1)
+                                                              PopupMenuButton<int>(
+                                                                tooltip: 'U wareeji Cashar kale',
+                                                                icon: const Icon(Icons.swap_horiz_rounded, size: 16),
+                                                                onSelected: (targetLsIdx) {
+                                                                  _relocateSection(chIdx, lsIdx, secIdx, targetLsIdx);
+                                                                  setModalState(() {});
+                                                                },
+                                                                itemBuilder: (context) => [
+                                                                  for (int l = 0; l < chapter.lessons.length; l++)
+                                                                    if (l != lsIdx)
+                                                                      PopupMenuItem(
+                                                                        value: l,
+                                                                        child: Text('U wareeji: ${chapter.lessons[l].title}'),
+                                                                      ),
+                                                                ],
+                                                              ),
+                                                            IconButton(
+                                                              tooltip: 'Wax ka beddel Section',
+                                                              icon: const Icon(Icons.edit_outlined, size: 16),
+                                                              onPressed: () {
+                                                                Navigator.pop(modalContext);
+                                                                _beginEditMarker(
+                                                                  kind: 'Section',
+                                                                  chapterIndex: chIdx,
+                                                                  lessonIndex: lsIdx,
+                                                                  sectionIndex: secIdx,
+                                                                );
+                                                              },
+                                                            ),
+                                                            IconButton(
+                                                              tooltip: 'Tirtir Section',
+                                                              icon: const Icon(Icons.delete_outline, size: 16, color: Colors.red),
+                                                              onPressed: () {
+                                                                _deleteSection(chIdx, lsIdx, secIdx);
+                                                                setModalState(() {});
+                                                              },
+                                                            ),
+                                                          ],
+                                                        ),
+                                                      );
+                                                    },
+                                                  ),
+                                                ],
+                                              ],
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ],
                                 ],
                               ),
-                              onExpansionChanged: (expanded) {
-                                if (expanded) {
-                                  setState(() {
-                                    _selectedChapterIndex = index;
-                                    _selectedLessonIndex = null;
-                                  });
-                                  _selectChapterPreview(chapter);
-                                }
-                              },
-                              children: [
-                                for (
-                                  var lessonIndex = 0;
-                                  lessonIndex < chapter.lessons.length;
-                                  lessonIndex++
-                                )
-                                  ExpansionTile(
-                                    tilePadding: const EdgeInsets.only(
-                                      left: 48,
-                                      right: 16,
-                                    ),
-                                    leading: const Icon(
-                                      Icons.menu_book_outlined,
-                                      size: 18,
-                                    ),
-                                    title: Text(
-                                      chapter.lessons[lessonIndex].title,
-                                    ),
-                                    subtitle: Text(
-                                      'Bogagga ${chapter.lessons[lessonIndex].startPage}–${chapter.lessons[lessonIndex].endPage} • ${chapter.lessons[lessonIndex].sections.length} sections',
-                                    ),
-                                    trailing: Row(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        IconButton(
-                                          tooltip: 'Wax ka beddel Lesson',
-                                          onPressed: () {
-                                            Navigator.pop(context);
-                                            _beginEditMarker(
-                                              kind: 'Lesson',
-                                              chapterIndex: index,
-                                              lessonIndex: lessonIndex,
-                                            );
-                                          },
-                                          icon: const Icon(
-                                            Icons.edit_outlined,
-                                            size: 20,
-                                          ),
-                                        ),
-                                        IconButton(
-                                          tooltip: 'Tirtir Lesson',
-                                          onPressed: () {
-                                            Navigator.pop(context);
-                                            _deleteLesson(index, lessonIndex);
-                                          },
-                                          icon: const Icon(
-                                            Icons.delete_outline,
-                                            size: 20,
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                    onExpansionChanged: (expanded) {
-                                      if (!expanded) return;
-                                      final lesson =
-                                          chapter.lessons[lessonIndex];
-                                      setState(() {
-                                        _selectedChapterIndex = index;
-                                        _selectedLessonIndex = lessonIndex;
-                                      });
-                                      _selectLessonPreview(lesson);
-                                    },
-                                    children: [
-                                      for (
-                                        var sectionIndex = 0;
-                                        sectionIndex <
-                                            chapter
-                                                .lessons[lessonIndex]
-                                                .sections
-                                                .length;
-                                        sectionIndex++
-                                      )
-                                        ListTile(
-                                          contentPadding: const EdgeInsets.only(
-                                            left: 96,
-                                            right: 16,
-                                          ),
-                                          leading: const Icon(
-                                            Icons.segment,
-                                            size: 18,
-                                          ),
-                                          title: Text(
-                                            chapter
-                                                .lessons[lessonIndex]
-                                                .sections[sectionIndex]
-                                                .title,
-                                          ),
-                                          subtitle: Text(
-                                            'Bogagga ${chapter.lessons[lessonIndex].sections[sectionIndex].startPage}–${chapter.lessons[lessonIndex].sections[sectionIndex].endPage}',
-                                          ),
-                                          trailing: Row(
-                                            mainAxisSize: MainAxisSize.min,
-                                            children: [
-                                              IconButton(
-                                                tooltip:
-                                                    'Ku Baro AI Tutor (PDF Slice)',
-                                                onPressed: () {
-                                                  Navigator.pop(context);
-                                                  final section = chapter
-                                                      .lessons[lessonIndex]
-                                                      .sections[sectionIndex];
-                                                  final lesson = chapter
-                                                      .lessons[lessonIndex];
-                                                  if (widget.onOpenChat !=
-                                                      null) {
-                                                    widget.onOpenChat!(
-                                                      book,
-                                                      chapter: chapter.title,
-                                                      lesson: lesson.title,
-                                                      section: section.title,
-                                                    );
-                                                  } else {
-                                                    Navigator.push(
-                                                      context,
-                                                      MaterialPageRoute(
-                                                        builder: (_) =>
-                                                            BookChatScreen(
-                                                              book: book,
-                                                              initialChapter:
-                                                                  chapter.title,
-                                                              initialLesson:
-                                                                  lesson.title,
-                                                              initialSection:
-                                                                  section.title,
-                                                            ),
-                                                      ),
-                                                    );
-                                                  }
-                                                },
-                                                icon: Icon(
-                                                  Icons.auto_awesome,
-                                                  size: 18,
-                                                  color: Theme.of(
-                                                    context,
-                                                  ).colorScheme.primary,
-                                                ),
-                                              ),
-                                              IconButton(
-                                                tooltip:
-                                                    'Wax ka beddel Section',
-                                                onPressed: () {
-                                                  Navigator.pop(context);
-                                                  _beginEditMarker(
-                                                    kind: 'Section',
-                                                    chapterIndex: index,
-                                                    lessonIndex: lessonIndex,
-                                                    sectionIndex: sectionIndex,
-                                                  );
-                                                },
-                                                icon: const Icon(
-                                                  Icons.edit_outlined,
-                                                  size: 19,
-                                                ),
-                                              ),
-                                              IconButton(
-                                                tooltip: 'Tirtir Section',
-                                                onPressed: () {
-                                                  Navigator.pop(context);
-                                                  _deleteSection(
-                                                    index,
-                                                    lessonIndex,
-                                                    sectionIndex,
-                                                  );
-                                                },
-                                                icon: const Icon(
-                                                  Icons.delete_outline,
-                                                  size: 19,
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                          onTap: () {
-                                            final section = chapter
-                                                .lessons[lessonIndex]
-                                                .sections[sectionIndex];
-                                            setState(() {
-                                              _selectedChapterIndex = index;
-                                              _selectedLessonIndex =
-                                                  lessonIndex;
-                                            });
-                                            Navigator.pop(context);
-                                            _selectPreview(
-                                              section.title,
-                                              section.startPage,
-                                              section.endPage,
-                                              startPosition:
-                                                  section.startPosition,
-                                              endPosition: section.endPosition,
-                                            );
-                                          },
-                                        ),
-                                    ],
-                                  ),
-                              ],
-                            ),
-                          );
-                        },
-                      ),
-              ),
-            ],
-          ),
-        ),
+                            );
+                          },
+                        ),
+                ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
@@ -1344,31 +1767,57 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
     return Scaffold(
       appBar: AppBar(
         leading: IconButton(
-          tooltip: 'Ka bax book-ga',
+          tooltip: book != null
+              ? 'Ka bax buugga'
+              : (widget.onBackToAdmin != null
+                  ? 'Ku noqo Admin Dashboard'
+                  : 'Ku noqo Chat-ka'),
           onPressed: _leaveBook,
           icon: const Icon(Icons.arrow_back),
         ),
-        title: Row(
-          children: [
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                book?.title ?? 'Book Preparation Tool',
+        title: book != null
+            ? Text(
+                book.title,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
+              )
+            : const Text(
+                'Book Editor',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
               ),
-            ),
-          ],
-        ),
         actions: [
           if (book != null)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 8),
-              child: FilledButton.tonalIcon(
-                onPressed: _publishToLibrary,
-                icon: const Icon(Icons.cloud_upload_outlined, size: 18),
-                label: const Text(''),
+            IconButton(
+              tooltip: _showThumbnails ? 'Qari Thumbnails-ka' : 'Muuji Thumbnails-ka bogagga',
+              icon: Icon(
+                _showThumbnails
+                    ? Icons.view_sidebar_rounded
+                    : Icons.view_sidebar_outlined,
               ),
+              onPressed: () => setState(() => _showThumbnails = !_showThumbnails),
+            ),
+          if (book != null)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+              child: widget.returnToPreview
+                  ? FilledButton.icon(
+                      onPressed: _doneAndReturnToPreview,
+                      icon: const Icon(Icons.check_circle_rounded, size: 18),
+                      label: const Text('Done ➔ Ku noqo Hubinta'),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: const Color(0xFF16A34A),
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                      ),
+                    )
+                  : FilledButton.icon(
+                      onPressed: _sendToPreview,
+                      icon: const Icon(Icons.remove_red_eye_rounded, size: 18),
+                      label: const Text('U gudbi Preview'),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: const Color(0xFF0022FF),
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                      ),
+                    ),
             ),
           if (book != null)
             IconButton(
@@ -1380,11 +1829,22 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
             PopupMenuButton<String>(
               tooltip: 'Fursado dheeraad ah',
               onSelected: (value) {
+                if (value == 'preview') _sendToPreview();
                 if (value == 'save') _saveDraft();
                 if (value == 'publish') _publishToLibrary();
                 if (value == 'library') widget.onOpenLibrary?.call();
               },
               itemBuilder: (_) => [
+                const PopupMenuItem(
+                  value: 'preview',
+                  child: Row(
+                    children: [
+                      Icon(Icons.remove_red_eye_outlined, size: 18),
+                      SizedBox(width: 8),
+                      Text('U Gudbi Preview (Hubinta)'),
+                    ],
+                  ),
+                ),
                 const PopupMenuItem(
                   value: 'save',
                   child: Row(
@@ -1421,34 +1881,44 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
         ],
       ),
       body: book == null || _pdfBytes == null
-          ? _buildSavedBooksHome()
+          ? _buildNoBookSelectedView()
           : Column(
               children: [
                 if (_markerKind != null || _previewRange != null)
                   _buildPreviewBar(book),
                 Expanded(
-                  child: Stack(
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      SfPdfViewer.memory(
-                        _pdfBytes!,
-                        controller: _pdfController,
-                        enableTextSelection: true,
-                        canShowTextSelectionMenu: true,
-                        pageLayoutMode: PdfPageLayoutMode.single,
-                        onPageChanged: _handlePageChanged,
-                        onTap: _handlePdfTap,
-                      ),
-                      if (_markerKind != null)
-                        _markerOverlay()
-                      else if (_previewRange != null)
-                        _previewOverlay(),
-                      Positioned(
-                        right: 14,
-                        top: 20,
-                        bottom: 20,
-                        child: Align(
-                          alignment: Alignment.topRight,
-                          child: _buildFloatingNotionNav(book),
+                      if (_showThumbnails)
+                        _buildThumbnailsSidebar(book),
+                      Expanded(
+                        child: Stack(
+                          children: [
+                            SfPdfViewer.memory(
+                              _pdfBytes!,
+                              key: ValueKey('pdf_editor_${book.id}_${_pdfBytes!.length}'),
+                              controller: _pdfController,
+                              enableTextSelection: true,
+                              canShowTextSelectionMenu: true,
+                              pageLayoutMode: PdfPageLayoutMode.single,
+                              onPageChanged: _handlePageChanged,
+                              onTap: _handlePdfTap,
+                            ),
+                            if (_markerKind != null)
+                              _markerOverlay()
+                            else if (_previewRange != null)
+                              _previewOverlay(),
+                            Positioned(
+                              right: 14,
+                              top: 20,
+                              bottom: 20,
+                              child: Align(
+                                alignment: Alignment.topRight,
+                                child: _buildFloatingNotionNav(book),
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                     ],
@@ -1750,52 +2220,202 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
     );
   }
 
-  Widget _buildSavedBooksHome() => Padding(
-    padding: const EdgeInsets.all(24),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Align(
-          alignment: Alignment.centerLeft,
-          child: FilledButton.icon(
-            onPressed: _choosePdf,
-            icon: const Icon(Icons.upload_file),
-            label: const Text('Soo geli PDF cusub'),
+  Widget _buildNoBookSelectedView() => Center(
+    child: Padding(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.menu_book_rounded, size: 56, color: Colors.grey.shade400),
+          const SizedBox(height: 16),
+          const Text(
+            'Ma jiro buug hadda furan.',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
           ),
-        ),
-        const SizedBox(height: 24),
-        Text(
-          'Buugaagta Local-ka',
-          style: Theme.of(context).textTheme.headlineSmall,
-        ),
-        const SizedBox(height: 12),
-        Expanded(
-          child: _savedBooks.isEmpty
-              ? const Center(child: Text('Weli ma jiro book la diyaariyay.'))
-              : ListView.separated(
-                  itemCount: _savedBooks.length,
-                  separatorBuilder: (_, _) => const Divider(),
-                  itemBuilder: (context, index) {
-                    final saved = _savedBooks[index];
-                    return ListTile(
-                      leading: const Icon(Icons.picture_as_pdf_outlined),
-                      title: Text(saved.title),
-                      subtitle: Text(
-                        '${saved.pageCount} pages • ${saved.chapters.length} chapters • ${saved.status.name}',
-                      ),
-                      onTap: () => _openSavedBook(saved),
-                      trailing: IconButton(
-                        tooltip: 'Tirtir',
-                        onPressed: () => _deleteSavedBook(saved),
-                        icon: const Icon(Icons.delete_outline),
-                      ),
-                    );
-                  },
-                ),
-        ),
-      ],
+          const SizedBox(height: 8),
+          Text(
+            'Fadlan ka dooro buug qaybta Maamulka Buugaagta (Book Management).',
+            style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
+          ),
+          const SizedBox(height: 20),
+          FilledButton.icon(
+            onPressed: _leaveBook,
+            icon: const Icon(Icons.arrow_back),
+            label: const Text('Ku noqo Maamulka Buugaagta'),
+          ),
+        ],
+      ),
     ),
   );
+
+
+  Widget _buildThumbnailsSidebar(PreparedBook book) {
+    return Container(
+      width: 160,
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFC),
+        border: Border(right: BorderSide(color: Colors.grey.shade300)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            color: Colors.white,
+            child: Row(
+              children: [
+                const Icon(Icons.photo_library_outlined, size: 16, color: Color(0xFF0F172A)),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    'Bogagga (${book.pageCount})',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF0F172A),
+                    ),
+                  ),
+                ),
+                InkWell(
+                  onTap: () => setState(() => _showThumbnails = false),
+                  borderRadius: BorderRadius.circular(6),
+                  child: const Padding(
+                    padding: EdgeInsets.all(2),
+                    child: Icon(Icons.chevron_left_rounded, size: 20),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: ListView.builder(
+              padding: const EdgeInsets.all(8),
+              itemCount: book.pageCount,
+              itemBuilder: (context, idx) {
+                final pageNumber = idx + 1;
+                final isCurrentPage = _currentPage == pageNumber;
+
+                // Check markers on this page
+                bool hasChapter = book.chapters.any((c) => c.startPage == pageNumber);
+                bool hasLesson = book.chapters.any((c) => c.lessons.any((l) => l.startPage == pageNumber));
+                bool hasSection = book.chapters.any((c) => c.lessons.any((l) => l.sections.any((s) => s.startPage == pageNumber)));
+
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: InkWell(
+                    onTap: () {
+                      _pdfController.jumpToPage(pageNumber);
+                      setState(() {});
+                    },
+                    borderRadius: BorderRadius.circular(8),
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 150),
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: isCurrentPage ? Colors.white : Colors.white.withValues(alpha: 0.8),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: isCurrentPage ? const Color(0xFF0022FF) : Colors.grey.shade300,
+                          width: isCurrentPage ? 2 : 1,
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: isCurrentPage
+                                ? const Color(0xFF0022FF).withValues(alpha: 0.15)
+                                : Colors.black.withValues(alpha: 0.03),
+                            blurRadius: isCurrentPage ? 6 : 2,
+                            offset: const Offset(0, 1),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: isCurrentPage ? const Color(0xFF0022FF) : Colors.grey.shade100,
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Text(
+                                  'Bogga $pageNumber',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.bold,
+                                    color: isCurrentPage ? Colors.white : Colors.grey.shade700,
+                                  ),
+                                ),
+                              ),
+                              if (isCurrentPage)
+                                const Icon(Icons.arrow_forward_ios_rounded, size: 10, color: Color(0xFF0022FF)),
+                            ],
+                          ),
+                          const SizedBox(height: 6),
+                          Container(
+                            height: 52,
+                            decoration: BoxDecoration(
+                              color: Colors.grey.shade50,
+                              borderRadius: BorderRadius.circular(4),
+                              border: Border.all(color: Colors.grey.shade200),
+                            ),
+                            child: Center(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.article_outlined,
+                                    size: 20,
+                                    color: isCurrentPage ? const Color(0xFF0022FF) : Colors.grey.shade400,
+                                  ),
+                                  if (hasChapter || hasLesson || hasSection) ...[
+                                    const SizedBox(height: 4),
+                                    Row(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        if (hasChapter)
+                                          Container(
+                                            margin: const EdgeInsets.symmetric(horizontal: 1.5),
+                                            width: 5,
+                                            height: 5,
+                                            decoration: const BoxDecoration(color: Color(0xFF0022FF), shape: BoxShape.circle),
+                                          ),
+                                        if (hasLesson)
+                                          Container(
+                                            margin: const EdgeInsets.symmetric(horizontal: 1.5),
+                                            width: 5,
+                                            height: 5,
+                                            decoration: const BoxDecoration(color: Color(0xFF16A34A), shape: BoxShape.circle),
+                                          ),
+                                        if (hasSection)
+                                          Container(
+                                            margin: const EdgeInsets.symmetric(horizontal: 1.5),
+                                            width: 5,
+                                            height: 5,
+                                            decoration: const BoxDecoration(color: Color(0xFFD97706), shape: BoxShape.circle),
+                                          ),
+                                      ],
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _buildPreviewBar(PreparedBook book) => Material(
     color: Theme.of(context).colorScheme.secondaryContainer,
@@ -1826,22 +2446,138 @@ class _PreparedBookEditorScreenState extends State<PreparedBookEditorScreen> {
                   ),
           ),
           if (_markerKind != null) ...[
-            TextButton(
-              onPressed: () => setState(() {
+            // Bilow (Kore) Interactive Chip
+            InkWell(
+              onTap: () => setState(() {
                 _activeMarker = 'start';
                 _markerStartPage = _currentPage;
+                _message = 'Line-ka Bilowga (Kore) ayaa la doortay. Taabo meesha aad rabto.';
               }),
-              child: const Text('Bilow'),
+              borderRadius: BorderRadius.circular(8),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 200),
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: _activeMarker == 'start'
+                      ? const Color(0xFF0022FF)
+                      : Colors.white,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: _activeMarker == 'start'
+                        ? const Color(0xFF0022FF)
+                        : const Color(0xFFCBD5E1),
+                    width: 1.5,
+                  ),
+                  boxShadow: _activeMarker == 'start'
+                      ? [
+                          BoxShadow(
+                            color: const Color(0xFF0022FF).withValues(alpha: 0.3),
+                            blurRadius: 6,
+                            offset: const Offset(0, 2),
+                          ),
+                        ]
+                      : null,
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.vertical_align_top_rounded,
+                      size: 15,
+                      color: _activeMarker == 'start'
+                          ? Colors.white
+                          : const Color(0xFF0022FF),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      'Bilow (Kore): ${(_markerStartPosition * 100).toInt()}%',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: _activeMarker == 'start'
+                            ? Colors.white
+                            : const Color(0xFF1E293B),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ),
-            TextButton(
-              onPressed: () => setState(() {
+            const SizedBox(width: 8),
+
+            // Dhammaad (Hoose) Interactive Chip
+            InkWell(
+              onTap: () => setState(() {
                 _activeMarker = 'end';
                 _markerEndPage = _currentPage;
+                _message = 'Line-ka Dhammaadka (Hoose) ayaa la doortay. Taabo meesha aad rabto.';
               }),
-              child: const Text('Dhamad'),
+              borderRadius: BorderRadius.circular(8),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 200),
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: _activeMarker == 'end'
+                      ? const Color(0xFFD97706)
+                      : Colors.white,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: _activeMarker == 'end'
+                        ? const Color(0xFFD97706)
+                        : const Color(0xFFCBD5E1),
+                    width: 1.5,
+                  ),
+                  boxShadow: _activeMarker == 'end'
+                      ? [
+                          BoxShadow(
+                            color: const Color(0xFFD97706).withValues(alpha: 0.3),
+                            blurRadius: 6,
+                            offset: const Offset(0, 2),
+                          ),
+                        ]
+                      : null,
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.vertical_align_bottom_rounded,
+                      size: 15,
+                      color: _activeMarker == 'end'
+                          ? Colors.white
+                          : const Color(0xFFD97706),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      'Dhammaad (Hoose): ${(_markerEndPosition * 100).toInt()}%',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: _activeMarker == 'end'
+                            ? Colors.white
+                            : const Color(0xFF1E293B),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ),
-            FilledButton(onPressed: _finishMarker, child: const Text('Done')),
-            IconButton(onPressed: _cancelMarker, icon: const Icon(Icons.close)),
+            const SizedBox(width: 12),
+            FilledButton.icon(
+              onPressed: _finishMarker,
+              icon: const Icon(Icons.check_rounded, size: 16),
+              label: const Text('Done'),
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFF16A34A),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              ),
+            ),
+            const SizedBox(width: 4),
+            IconButton(
+              tooltip: 'Ka noqo',
+              onPressed: _cancelMarker,
+              icon: const Icon(Icons.close),
+            ),
           ],
           if (_previewRange != null)
             if (_markerKind == null)

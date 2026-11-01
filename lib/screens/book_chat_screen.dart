@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
+import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
 
 import '../models/book_knowledge.dart';
 import '../models/chat_session.dart';
@@ -16,7 +17,20 @@ import '../services/gemini_book_chat_service.dart';
 import '../services/pdf_visual_crop_service.dart';
 import '../services/pdf_slice_service.dart';
 import '../services/prepared_book_storage.dart';
+import '../services/gemini_tts_service.dart';
 import '../widgets/rich_tutor_markdown.dart';
+import '../models/ai_model_config.dart';
+import '../services/ai_model_storage.dart';
+import '../services/ai_routing_storage.dart';
+import '../services/admin_auth_service.dart';
+import '../models/app_telemetry_log.dart';
+import '../services/app_telemetry_storage.dart';
+import '../models/agent_execution_trace.dart';
+import '../services/agent_tools/agent_orchestrator.dart';
+import '../services/agent_trace_storage.dart';
+import '../models/user_profile.dart';
+import '../services/user_auth_service.dart';
+import '../widgets/student_profile_dialog.dart';
 
 class BookChatScreen extends StatefulWidget {
   const BookChatScreen({
@@ -28,6 +42,8 @@ class BookChatScreen extends StatefulWidget {
     this.initialMode,
     this.onOpenLibrary,
     this.onOpenEditor,
+    this.onOpenAdmin,
+    this.hideModelPicker,
   });
 
   final PreparedBook? book;
@@ -37,6 +53,8 @@ class BookChatScreen extends StatefulWidget {
   final TutorMode? initialMode;
   final VoidCallback? onOpenLibrary;
   final VoidCallback? onOpenEditor;
+  final VoidCallback? onOpenAdmin;
+  final bool? hideModelPicker;
 
   @override
   State<BookChatScreen> createState() => _BookChatScreenState();
@@ -55,9 +73,16 @@ class _BookChatScreenState extends State<BookChatScreen> {
   final _bookStorage = const PreparedBookStorage();
   final _historyStorage = const ChatHistoryStorage();
   final _chatService = GeminiBookChatService();
+  final _ttsService = GeminiTtsService();
   final _pdfSliceService = const PdfSliceService();
   final _pdfVisualCropService = const PdfVisualCropService();
+  final _aiModelStorage = const AiModelStorage();
+  final _aiRoutingStorage = const AiRoutingStorage();
   final _messages = <_ChatEntry>[];
+
+  static final Set<String> _blacklistedModelIds = <String>{};
+  AiModelConfig? _activeAiModel;
+  bool _hideModelPicker = true;
 
   List<PreparedBook> _availableBooks = const [];
   PreparedBook? _currentBook;
@@ -67,12 +92,64 @@ class _BookChatScreenState extends State<BookChatScreen> {
   String? _focusLesson;
   String? _focusSection;
   LearningSession? _learningSession;
+  bool _isFocusManuallyCleared = false;
+
+  String? get _currentFocusScopeName {
+    if (_isFocusManuallyCleared) return null;
+    if (_focusSection != null && _focusSection!.trim().isNotEmpty) {
+      return _focusSection!.trim();
+    }
+    if (_learningSession?.sectionTitle != null &&
+        _learningSession!.sectionTitle!.trim().isNotEmpty) {
+      return _learningSession!.sectionTitle!.trim();
+    }
+    if (_focusLesson != null && _focusLesson!.trim().isNotEmpty) {
+      return _focusLesson!.trim();
+    }
+    if (_learningSession?.lessonTitle != null &&
+        _learningSession!.lessonTitle!.trim().isNotEmpty) {
+      return _learningSession!.lessonTitle!.trim();
+    }
+    if (_focusChapter != null && _focusChapter!.trim().isNotEmpty) {
+      return _focusChapter!.trim();
+    }
+    if (_learningSession?.chapterTitle != null &&
+        _learningSession!.chapterTitle!.trim().isNotEmpty) {
+      return _learningSession!.chapterTitle!.trim();
+    }
+    if (_learningSession?.scopeLabel != null &&
+        _learningSession!.scopeLabel.trim().isNotEmpty) {
+      return _learningSession!.scopeLabel.trim();
+    }
+    for (final m in _messages.reversed) {
+      if (m.sectionTitle != null && m.sectionTitle!.trim().isNotEmpty) {
+        return m.sectionTitle!.trim();
+      }
+      if (m.lessonTitle != null && m.lessonTitle!.trim().isNotEmpty) {
+        return m.lessonTitle!.trim();
+      }
+      if (m.scopeLabel != null && m.scopeLabel!.trim().isNotEmpty) {
+        return m.scopeLabel!.trim();
+      }
+    }
+    return null;
+  }
+
+  String _formatScope12(String name) {
+    final clean = name.trim();
+    if (clean.length > 12) {
+      return '${clean.substring(0, 12)}...';
+    }
+    return clean;
+  }
 
   bool _loading = true;
   final Map<String, CancellationToken> _activeGenerations = {};
   bool get _isCurrentSessionSending =>
       _activeGenerations.containsKey(_currentSessionId);
   String? _error;
+  String? _lastFailedQuestion;
+  TutorMode? _lastFailedMode;
 
   void _stopCurrentGeneration({String? targetSessionId}) {
     final sId = targetSessionId ?? _currentSessionId;
@@ -106,6 +183,7 @@ class _BookChatScreenState extends State<BookChatScreen> {
 
   @override
   void dispose() {
+    _ttsService.dispose();
     _questionController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -124,6 +202,7 @@ class _BookChatScreenState extends State<BookChatScreen> {
     _currentBook = active;
 
     await _loadHistory();
+    await _loadActiveAiModel();
 
     if (active != null) {
       await _loadKnowledgeForBook(active);
@@ -135,6 +214,245 @@ class _BookChatScreenState extends State<BookChatScreen> {
         });
       }
     }
+  }
+
+  Future<void> _loadActiveAiModel() async {
+    final routingConfig = await _aiRoutingStorage.getConfig();
+    final tierModels = await _aiRoutingStorage.getActiveTierModels();
+    final allModels = await _aiModelStorage.getModels();
+    final activeModels = allModels
+        .where((m) => m.isActive && m.isVerified)
+        .toList();
+    final activeId = await _aiModelStorage.getSelectedModelId();
+    AiModelConfig? selected =
+        tierModels.firstOrNull ??
+        activeModels.where((m) => m.id == activeId).firstOrNull ??
+        activeModels.firstOrNull;
+
+    if (mounted) {
+      setState(() {
+        _activeAiModel = selected;
+        _hideModelPicker =
+            widget.hideModelPicker ?? routingConfig.hideModelPickerFromChat;
+      });
+    }
+  }
+
+  Future<void> _showModelPickerSheet() async {
+    final theme = Theme.of(context);
+    final allModels = await _aiModelStorage.getModels();
+    final activeModels = allModels
+        .where((m) => m.isActive && m.isVerified)
+        .toList();
+    if (!mounted) return;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 20),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.smart_toy_rounded,
+                            color: theme.colorScheme.primary,
+                            size: 22,
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Dooro AI Model',
+                                  style: theme.textTheme.titleMedium?.copyWith(
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                Text(
+                                  'Dooro model-ka aad rabto in Leyli kuugu jawaabto',
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.close),
+                            onPressed: () => Navigator.pop(context),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Divider(height: 20),
+                    if (activeModels.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.all(24),
+                        child: Center(
+                          child: Text(
+                            'Ma jiro model hadda loo fasaxay chat-ka.',
+                          ),
+                        ),
+                      )
+                    else
+                      Flexible(
+                        child: ListView.separated(
+                          shrinkWrap: true,
+                          itemCount: activeModels.length,
+                          separatorBuilder: (_, _) =>
+                              const Divider(height: 1, indent: 64),
+                          itemBuilder: (context, idx) {
+                            final model = activeModels[idx];
+                            final isSelected = _activeAiModel?.id == model.id;
+
+                            return ListTile(
+                              leading: CircleAvatar(
+                                radius: 18,
+                                backgroundColor: model.isOpenAiCompatible
+                                    ? const Color(0xFF10A37F)
+                                    : const Color(0xFF1A73E8),
+                                child: Text(
+                                  model.company.isNotEmpty
+                                      ? model.company
+                                            .substring(
+                                              0,
+                                              model.company.length > 2
+                                                  ? 2
+                                                  : model.company.length,
+                                            )
+                                            .toUpperCase()
+                                      : 'AI',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                              title: Row(
+                                children: [
+                                  Flexible(
+                                    child: Text(
+                                      model.displayName,
+                                      style: TextStyle(
+                                        fontWeight: isSelected
+                                            ? FontWeight.bold
+                                            : FontWeight.w500,
+                                        color: isSelected
+                                            ? theme.colorScheme.primary
+                                            : null,
+                                      ),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 6,
+                                      vertical: 1.5,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: model.isFree
+                                          ? const Color(0xFFE8F5E9)
+                                          : const Color(0xFFFFF8E1),
+                                      borderRadius: BorderRadius.circular(6),
+                                      border: Border.all(
+                                        color: model.isFree
+                                            ? const Color(0xFF81C784)
+                                            : const Color(0xFFFFD54F),
+                                      ),
+                                    ),
+                                    child: Text(
+                                      model.isFree ? 'Free' : 'Paid',
+                                      style: TextStyle(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.bold,
+                                        color: model.isFree
+                                            ? const Color(0xFF1B5E20)
+                                            : const Color(0xFFE65100),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              subtitle: Text(
+                                '${model.company} • ${model.modelId}',
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                              trailing: isSelected
+                                  ? Icon(
+                                      Icons.check_circle_rounded,
+                                      color: theme.colorScheme.primary,
+                                    )
+                                  : null,
+                              onTap: () async {
+                                await _aiModelStorage.setSelectedModelId(
+                                  model.id,
+                                );
+                                if (!mounted) return;
+                                setState(() {
+                                  _activeAiModel = model;
+                                });
+                                Navigator.pop(context);
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text(
+                                      'Model-ka la doortay: ${model.displayName}',
+                                    ),
+                                    duration: const Duration(seconds: 2),
+                                    backgroundColor: theme.colorScheme.primary,
+                                  ),
+                                );
+                              },
+                            );
+                          },
+                        ),
+                      ),
+                    const Divider(height: 16),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: OutlinedButton.icon(
+                        onPressed: () {
+                          Navigator.pop(context);
+                          widget.onOpenEditor?.call();
+                        },
+                        icon: const Icon(Icons.add_circle_outline, size: 18),
+                        label: const Text(
+                          'Maaree ama Ku dar Model Cusub (Editor-ka)',
+                        ),
+                        style: OutlinedButton.styleFrom(
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
   }
 
   Future<void> _loadHistory() async {
@@ -199,6 +517,7 @@ class _BookChatScreenState extends State<BookChatScreen> {
 
   void _startNewChat({bool clearBook = true}) {
     setState(() {
+      _isFocusManuallyCleared = false;
       _currentSessionId = DateTime.now().millisecondsSinceEpoch.toString();
       if (clearBook) {
         _currentBook = null;
@@ -223,6 +542,7 @@ class _BookChatScreenState extends State<BookChatScreen> {
     }
 
     setState(() {
+      _isFocusManuallyCleared = false;
       _currentSessionId = session.id;
       _currentBook = foundBook;
       _focusChapter = session.focusChapter;
@@ -664,16 +984,85 @@ class _BookChatScreenState extends State<BookChatScreen> {
     );
   }
 
+  String _formatInjectedContext({
+    PreparedBook? book,
+    required ({
+      int startPage,
+      int endPage,
+      double startPosition,
+      double endPosition,
+      String label,
+      String type,
+    })
+    scope,
+    required TutorMode mode,
+    required bool hasPdf,
+    LearningSession? learningSession,
+  }) {
+    final buffer = StringBuffer();
+    buffer.writeln('Habka Waxbarashada (Mode): ${mode.name}');
+    if (book != null) {
+      buffer.writeln('Buugga: ${book.title} (${book.category})');
+      buffer.writeln('Xadka (Scope): ${scope.label}');
+      if (_focusChapter != null && _focusChapter!.trim().isNotEmpty) {
+        buffer.writeln('• Cutubka: $_focusChapter');
+      }
+      if (_focusLesson != null && _focusLesson!.trim().isNotEmpty) {
+        buffer.writeln('• Casharka: $_focusLesson');
+      }
+      if (_focusSection != null && _focusSection!.trim().isNotEmpty) {
+        buffer.writeln('• Qaybta (Section): $_focusSection');
+      }
+      buffer.writeln('• Bogagga: ${scope.startPage} ilaa ${scope.endPage}');
+      if ((scope.startPosition > 0.02) || (scope.endPosition < 0.98)) {
+        buffer.writeln(
+          '• Goynta Xadka Bogga: ${(scope.startPosition * 100).toInt()}% - ${(scope.endPosition * 100).toInt()}%',
+        );
+      }
+      buffer.writeln(
+        '• Lifaaqa PDF: ${hasPdf ? "Haa (PDF-ka casharka waa la jaray)" : "Maya"}',
+      );
+    } else {
+      buffer.writeln(
+        'Buug: Toos ah (Wada-hadal guud oo aan buug gaar ah ku xirnayn)',
+      );
+    }
+    if (learningSession != null) {
+      buffer.writeln(
+        'Qaybta Casharka: Qaybta ${learningSession.currentPartIndex + 1} ee ${learningSession.partCount}',
+      );
+    }
+    return buffer.toString().trim();
+  }
+
+  String _resolveChatTitle(
+    String sessionId,
+    PreparedBook? book,
+    String userDisplay,
+  ) {
+    for (final s in _historySessions) {
+      if (s.id == sessionId && s.title.trim().isNotEmpty) {
+        return s.title;
+      }
+    }
+    if (book != null && book.title.trim().isNotEmpty) {
+      return book.title;
+    }
+    final clean = userDisplay.trim().replaceAll('\n', ' ');
+    if (clean.length > 36) return '${clean.substring(0, 36)}...';
+    return clean.isEmpty ? 'Sheeko Cusub' : clean;
+  }
+
   Future<void> _executeTutorAction(
     TutorMode mode, {
     String? customPrompt,
   }) async {
     if (_isCurrentSessionSending) return;
 
-    final book = _currentBook;
-    final knowledge = _knowledge;
-    final scope = _resolveCurrentLearningPart(_resolveCurrentScope());
-    final isLessonScope =
+    var book = _currentBook;
+    var knowledge = _knowledge;
+    var scope = _resolveCurrentLearningPart(_resolveCurrentScope());
+    var isLessonScope =
         _learningSession?.scopeType == LearningScopeType.lesson ||
         _learningSession?.scopeType == LearningScopeType.section;
 
@@ -699,7 +1088,7 @@ class _BookChatScreenState extends State<BookChatScreen> {
         break;
     }
 
-    final isFinalPart =
+    var isFinalPart =
         _isLessonExplanationRequest(mode, userDisplay) &&
         isLessonScope &&
         !(_learningSession?.hasNextPart ?? false);
@@ -714,9 +1103,38 @@ class _BookChatScreenState extends State<BookChatScreen> {
     setState(() {
       _messages.add(_ChatEntry(text: userDisplay, isUser: true));
       _error = null;
+      _lastFailedQuestion = null;
+      _lastFailedMode = null;
     });
     _saveCurrentSessionToHistory();
-    _scrollToBottom();
+    final messageTimestamp = DateTime.now();
+    final telemetryAttempts = <ModelAttemptLog>[];
+    final agentToolCalls = <AgentToolCallLog>[];
+    final agentModelCalls = <AgentModelCallLog>[];
+    final usesAgentTools = mode == TutorMode.freeChat;
+    final turnAgentOrchestrator = AgentOrchestrator();
+    if (usesAgentTools) turnAgentOrchestrator.beginToolTurn();
+
+    String? capturedSystemPrompt;
+    String? capturedAugmentedPrompt;
+    String? injectedContextSummary;
+    final candidateQueue = <AiModelConfig>[];
+
+    final liveExecutionId =
+        'live_${targetSessionId}_${DateTime.now().microsecondsSinceEpoch}';
+    AgentTraceStorage.instance.startLiveExecution(
+      AgentLiveExecution(
+        id: liveExecutionId,
+        sessionId: targetSessionId,
+        chatTitle: _resolveChatTitle(targetSessionId, book, userDisplay),
+        userMessage: userDisplay,
+        studentForm: _selectedForm,
+        mode: mode.name,
+        startedAt: messageTimestamp,
+        currentStatus: 'Diyaarinta codsiga iyo xogta manhajka...',
+        activeStepName: 'Tallaabada 1: Diyaarinta & Falanqaynta',
+      ),
+    );
 
     try {
       Uint8List? slicedPdfBytes;
@@ -731,27 +1149,440 @@ class _BookChatScreenState extends State<BookChatScreen> {
         );
       }
 
+      injectedContextSummary = _formatInjectedContext(
+        book: book,
+        scope: scope,
+        mode: mode,
+        hasPdf: slicedPdfBytes != null && slicedPdfBytes.isNotEmpty,
+        learningSession: _learningSession,
+      );
+
       if (token.isCancelled) return;
 
-      final answer = await _chatService.ask(
-        book: book,
-        knowledge: knowledge,
-        question: userDisplay,
-        focusChapter: _focusChapter,
-        focusLesson: _focusLesson,
-        focusSection: _focusSection,
-        startPosition: scope.startPosition,
-        endPosition: scope.endPosition,
-        slicedPdfBytes: slicedPdfBytes,
-        mode: mode,
-        learningScopeType: _learningSession?.scopeType,
-        learningPartNumber: _learningSession == null
-            ? null
-            : _learningSession!.currentPartIndex + 1,
-        learningPartCount: _learningSession?.partCount,
-        priorLearningContext: _recentLearningContext(),
-        isLessonCompletion: isFinalPart,
-        cancellationToken: token,
+      // Build candidate queue STRICTLY from App Routing (Stage 4) in configured priority order
+      final routingConfig = await _aiRoutingStorage.getConfig();
+      final tierModels = await _aiRoutingStorage.getActiveTierModels();
+
+      candidateQueue.clear();
+      for (final m in tierModels) {
+        if (m.isActive &&
+            !candidateQueue.any((c) => c.id == m.id) &&
+            !_blacklistedModelIds.contains(m.id) &&
+            !_blacklistedModelIds.contains(m.modelId)) {
+          candidateQueue.add(m);
+        }
+      }
+
+      // Fallback only if App Routing has no models configured at all
+      if (candidateQueue.isEmpty) {
+        final allModels = await _aiModelStorage.getModels();
+        for (final m in allModels) {
+          if (m.isActive &&
+              m.isVerified &&
+              !candidateQueue.any((c) => c.id == m.id) &&
+              !_blacklistedModelIds.contains(m.id) &&
+              !_blacklistedModelIds.contains(m.modelId)) {
+            candidateQueue.add(m);
+          }
+        }
+      }
+
+      // Always reflect the configured primary model in the active indicator
+      if (candidateQueue.isNotEmpty &&
+          _activeAiModel?.id != candidateQueue.first.id) {
+        setState(() => _activeAiModel = candidateQueue.first);
+      }
+
+      if (candidateQueue.isNotEmpty) {
+        AgentTraceStorage.instance.updateLiveExecution(
+          id: liveExecutionId,
+          currentModelName: candidateQueue.first.displayName,
+          currentStatus: 'Weydiinta ${candidateQueue.first.displayName}...',
+        );
+      }
+
+      AiModelConfig? answeredCandidate;
+      int answeredDurationMs = 0;
+      String? answer;
+      dynamic lastFailError;
+      final turnContext = AgentTurnContext();
+
+      for (int i = 0; i < candidateQueue.length; i++) {
+        final candidate = candidateQueue[i];
+        final isLast = (i == candidateQueue.length - 1);
+
+        if (token.isCancelled) return;
+
+        // If a previous model already retrieved the lesson PDF bytes, preserve it!
+        if (slicedPdfBytes == null && turnContext.discoveredPdfBytes != null) {
+          slicedPdfBytes = turnContext.discoveredPdfBytes;
+        }
+
+        final candidateStopwatch = Stopwatch()..start();
+        try {
+          AgentTraceStorage.instance.updateLiveExecution(
+            id: liveExecutionId,
+            currentModelName: candidate.displayName,
+            currentStatus: i == 0
+                ? 'Weydiinta ${candidate.displayName}...'
+                : 'Wareejin (Failover): Weydiinta ${candidate.displayName} (Context-kii la dhowray)...',
+            activeStepName: 'Model Call: ${candidate.displayName}',
+          );
+
+          answer = await _chatService.ask(
+            book: book,
+            knowledge: knowledge,
+            question: userDisplay,
+            focusChapter: _focusChapter,
+            focusLesson: _focusLesson,
+            focusSection: _focusSection,
+            startPosition: scope.startPosition,
+            endPosition: scope.endPosition,
+            slicedPdfBytes: slicedPdfBytes,
+            mode: mode,
+            learningScopeType: _learningSession?.scopeType,
+            learningPartNumber: _learningSession == null
+                ? null
+                : _learningSession!.currentPartIndex + 1,
+            learningPartCount: _learningSession?.partCount,
+            priorLearningContext: _recentLearningContext(),
+            conversationContext: _recentConversationContext(),
+            studentFormLevel: _selectedForm,
+            availableBookTitles: _availableBooks
+                .where((b) {
+                  final cat = b.category.toLowerCase().trim();
+                  final target = _selectedForm.toLowerCase().trim();
+                  return cat == target ||
+                      cat.contains(target) ||
+                      target.contains(cat);
+                })
+                .map((b) => b.title)
+                .toList(),
+            toolExecutor: usesAgentTools
+                ? (name, arguments) async {
+                    final res = await turnAgentOrchestrator.executeToolCall(
+                      name,
+                      arguments,
+                      formLevel: _selectedForm,
+                      conversationContext: _recentConversationContext(),
+                    );
+                    final match = turnAgentOrchestrator.lastToolMatch;
+                    if (match != null &&
+                        mounted &&
+                        _currentSessionId == targetSessionId) {
+                      setState(() {
+                        _isFocusManuallyCleared = false;
+                        _currentBook = match.book;
+                        _focusChapter = match.chapter.title;
+                        _focusLesson = match.lesson.title;
+                        _focusSection = match.section?.title;
+                        _learningSession = LearningSession(
+                          id: targetSessionId,
+                          bookId: match.book.id,
+                          bookTitle: match.book.title,
+                          chapterId: match.chapter.id,
+                          chapterTitle: match.chapter.title,
+                          lessonId: match.lesson.id,
+                          lessonTitle: match.lesson.title,
+                          sectionId: match.section?.id,
+                          sectionTitle: match.section?.title,
+                          scopeType: match.section == null
+                              ? LearningScopeType.lesson
+                              : LearningScopeType.section,
+                          scopeLabel:
+                              match.section?.title ?? match.lesson.title,
+                          startedAt: DateTime.now(),
+                        );
+                      });
+                    }
+                    return res;
+                  }
+                : null,
+            onToolCall: usesAgentTools
+                ? (call) {
+                    agentToolCalls.add(call);
+                    AgentTraceStorage.instance.updateLiveExecution(
+                      id: liveExecutionId,
+                      addToolCall: call,
+                      currentStatus: call.isSuccess
+                          ? 'Tool-ka "${call.toolName}" wuu dhameystirmay (${formatTraceDuration(call.latencyMs)})'
+                          : 'Tool-ka "${call.toolName}" wuu fashilmay',
+                      activeStepName: 'Tool: ${call.toolName}',
+                    );
+                  }
+                : null,
+            onModelCall: (mCall) {
+              agentModelCalls.add(mCall);
+              AgentTraceStorage.instance.updateLiveExecution(
+                id: liveExecutionId,
+                addModelCall: mCall,
+                currentModelName: mCall.modelName,
+                currentStatus: mCall.callType,
+                activeStepName: mCall.isSuccess
+                    ? 'Guulaystay: ${mCall.callType}'
+                    : 'Cillad: ${mCall.callType}',
+              );
+            },
+            onPromptGenerated: ({required systemPrompt, required userPrompt}) {
+              capturedSystemPrompt = systemPrompt;
+              capturedAugmentedPrompt = userPrompt;
+            },
+            isLessonCompletion: isFinalPart,
+            modelConfig: candidate,
+            cancellationToken: token,
+            turnContext: turnContext,
+          );
+          candidateStopwatch.stop();
+          answeredDurationMs = candidateStopwatch.elapsedMilliseconds;
+          answeredCandidate = candidate;
+          telemetryAttempts.add(
+            ModelAttemptLog(
+              modelName: candidate.displayName,
+              modelId: candidate.modelId,
+              isSuccess: true,
+              latencyMs: answeredDurationMs,
+              timestamp: DateTime.now(),
+            ),
+          );
+
+          // Success! Check if failover occurred
+          if (i > 0) {
+            final failedModel = candidateQueue[0];
+            await _aiRoutingStorage.recordFailover(
+              failedModelName: failedModel.displayName,
+              fallbackModelName: candidate.displayName,
+              reason: 'Ciriiri ama Timeout (1 daqiiqo)',
+            );
+            if (mounted) {
+              // Note: Do NOT permanently change _activeAiModel.
+              // Subsequent messages will start fresh with candidateQueue[0] (the primary configured model).
+              ScaffoldMessenger.of(context).hideCurrentSnackBar();
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Row(
+                    children: [
+                      const Icon(
+                        Icons.check_circle_outline_rounded,
+                        color: Colors.white,
+                        size: 18,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Ciriiri dartiis waxaa fariintan loogu wareegay oo loogu jawaabay: ${candidate.displayName}',
+                          style: const TextStyle(fontSize: 12.5),
+                        ),
+                      ),
+                    ],
+                  ),
+                  duration: const Duration(seconds: 4),
+                  backgroundColor: const Color(0xFF16A34A),
+                  behavior: SnackBarBehavior.floating,
+                ),
+              );
+            }
+          }
+          break; // Answer obtained successfully!
+        } on GeminiCancelledException {
+          rethrow;
+        } catch (err) {
+          candidateStopwatch.stop();
+          if (token.isCancelled) return;
+          lastFailError = err;
+          telemetryAttempts.add(
+            ModelAttemptLog(
+              modelName: candidate.displayName,
+              modelId: candidate.modelId,
+              isSuccess: false,
+              latencyMs: candidateStopwatch.elapsedMilliseconds,
+              errorMessage: err.toString(),
+              timestamp: DateTime.now(),
+            ),
+          );
+
+          final errStr = err.toString().toLowerCase();
+          if (errStr.contains('404') || errStr.contains('not found')) {
+            _blacklistedModelIds.add(candidate.id);
+            _blacklistedModelIds.add(candidate.modelId);
+          }
+
+          final isBusyOrTransient =
+              GeminiBookChatService.isCongestionOrBusyError(err) ||
+              GeminiBookChatService.isNetworkOrOfflineError(err) ||
+              GeminiBookChatService.isTimeoutError(err);
+          final shouldFallback =
+              !isLast &&
+              (routingConfig.autoFallbackEnabled || isBusyOrTransient);
+
+          if (shouldFallback) {
+            final nextCandidate = candidateQueue[i + 1];
+            debugPrint(
+              'Model ${candidate.displayName} busy/failed ($err). Failing over to ${nextCandidate.displayName}...',
+            );
+            AgentTraceStorage.instance.updateLiveExecution(
+              id: liveExecutionId,
+              currentModelName: nextCandidate.displayName,
+              currentStatus:
+                  '${candidate.displayName} wuu raagay/fashilmay. Waxaa loo wareegay: ${nextCandidate.displayName} (Xogtii la hayay ayaa loo dhiibay)...',
+              activeStepName:
+                  'Wareejin (Failover) ➔ ${nextCandidate.displayName}',
+            );
+            if (mounted && _currentSessionId == targetSessionId) {
+              ScaffoldMessenger.of(context).hideCurrentSnackBar();
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Row(
+                    children: [
+                      const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '${candidate.displayName} wuu mashquulsan yahay/raagay. Waxaa si toos ah loogu wareegay: ${nextCandidate.displayName}...',
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                      ),
+                    ],
+                  ),
+                  duration: const Duration(milliseconds: 2200),
+                  backgroundColor: const Color(0xFF0284C7),
+                  behavior: SnackBarBehavior.floating,
+                ),
+              );
+            }
+            continue; // Continue loop to next model!
+          } else {
+            // Cannot failover further
+            rethrow;
+          }
+        }
+      }
+
+      if (answer == null) {
+        throw lastFailError ??
+            const GeminiBookChatException(
+              'Dhammaan moodellada AI-gu waa mashquul ama waqtigoodii wuu dhacay.',
+            );
+      }
+      AgentTraceStorage.instance.finishLiveExecution(
+        liveExecutionId,
+        success: true,
+        finalAnswer: answer,
+      );
+
+      final discoveredMatch = usesAgentTools
+          ? turnAgentOrchestrator.lastToolMatch
+          : null;
+      if (discoveredMatch != null) {
+        if (mounted && _currentSessionId == targetSessionId) {
+          setState(() {
+            _isFocusManuallyCleared = false;
+            _currentBook = discoveredMatch.book;
+            _focusChapter = discoveredMatch.chapter.title;
+            _focusLesson = discoveredMatch.lesson.title;
+            _focusSection = discoveredMatch.section?.title;
+            _learningSession = LearningSession(
+              id: targetSessionId,
+              bookId: discoveredMatch.book.id,
+              bookTitle: discoveredMatch.book.title,
+              chapterId: discoveredMatch.chapter.id,
+              chapterTitle: discoveredMatch.chapter.title,
+              lessonId: discoveredMatch.lesson.id,
+              lessonTitle: discoveredMatch.lesson.title,
+              sectionId: discoveredMatch.section?.id,
+              sectionTitle: discoveredMatch.section?.title,
+              scopeType: discoveredMatch.section == null
+                  ? LearningScopeType.lesson
+                  : LearningScopeType.section,
+              scopeLabel:
+                  discoveredMatch.section?.title ??
+                  discoveredMatch.lesson.title,
+              startedAt: DateTime.now(),
+            );
+          });
+          await _loadKnowledgeForBook(
+            discoveredMatch.book,
+            preserveMessages: true,
+          );
+          book = discoveredMatch.book;
+          knowledge = _knowledge;
+          scope = _resolveCurrentLearningPart(_resolveCurrentScope());
+          slicedPdfBytes = await _obtainScopePdf(
+            book: book,
+            startPage: scope.startPage,
+            endPage: scope.endPage,
+            startPosition: scope.startPosition,
+            endPosition: scope.endPosition,
+            scopeTitle: scope.label,
+          );
+        }
+      }
+
+      final toolCallsSucceeded = agentToolCalls.every((call) => call.isSuccess);
+      await AgentTraceStorage.instance.recordTrace(
+        AgentExecutionTrace(
+          id: 'turn_${DateTime.now().microsecondsSinceEpoch}',
+          sessionId: targetSessionId,
+          chatTitle: _resolveChatTitle(targetSessionId, book, userDisplay),
+          timestamp: messageTimestamp,
+          userMessage: userDisplay,
+          studentForm: _selectedForm,
+          systemPrompt: capturedSystemPrompt,
+          augmentedPrompt: capturedAugmentedPrompt,
+          injectedContext: injectedContextSummary,
+          finalAnswer: answer,
+          modelName:
+              answeredCandidate?.displayName ?? answeredCandidate?.modelId,
+          mode: mode.name,
+          internalThought: agentToolCalls.isEmpty
+              ? 'Model-ku si toos ah ayuu uga jawaabay; tool manhaj ama PDF ah ma uusan dalban.'
+              : 'Model-ku wuxuu dalbaday ${agentToolCalls.length} tool-call; natiijooyinka iyo guusha waxaa lagu muujiyay raad-raacan.',
+          status: toolCallsSucceeded
+              ? AgentVerificationStatus.accepted
+              : AgentVerificationStatus.failed,
+          matchedBookId: discoveredMatch?.book.id ?? book?.id,
+          matchedBookTitle: discoveredMatch?.book.title ?? book?.title,
+          matchedCategory: discoveredMatch?.book.category ?? book?.category,
+          matchedChapterTitle: discoveredMatch?.chapter.title ?? _focusChapter,
+          matchedLessonTitle: discoveredMatch?.lesson.title ?? _focusLesson,
+          startPage: discoveredMatch?.startPage ?? scope.startPage,
+          endPage: discoveredMatch?.endPage ?? scope.endPage,
+          totalLatencyMs: answeredDurationMs,
+          modelLatencyMs: agentModelCalls.fold<int>(
+            0,
+            (sum, call) => sum + call.latencyMs,
+          ),
+          modelCalls: agentModelCalls,
+          toolCalls: agentToolCalls,
+          isSuccess: toolCallsSucceeded,
+        ),
+      );
+
+      // Record successful app telemetry
+      AppTelemetryStorage.instance.recordLog(
+        AppTelemetryLog(
+          id: '${DateTime.now().millisecondsSinceEpoch}',
+          timestamp: messageTimestamp,
+          userMessage: userDisplay,
+          bookId: book?.id,
+          bookTitle: book?.title,
+          bookCategory: book?.category,
+          focusChapter: _focusChapter,
+          focusLesson: _focusLesson,
+          focusSection: _focusSection,
+          scopeLabel: book != null ? scope.label : null,
+          answeredModelName: answeredCandidate?.displayName,
+          answeredModelId: answeredCandidate?.modelId,
+          responseTimeMs: answeredDurationMs,
+          isSuccess: true,
+          attempts: telemetryAttempts,
+        ),
       );
 
       if (token.isCancelled) return;
@@ -774,6 +1605,16 @@ class _BookChatScreenState extends State<BookChatScreen> {
         partIndex: _learningSession?.currentPartIndex,
         isLessonComplete: isFinalPart,
         visuals: visuals,
+        pdfBytes: slicedPdfBytes,
+        bookTitle: book?.title,
+        chapterTitle: _focusChapter,
+        lessonTitle: _focusLesson,
+        sectionTitle: _focusSection,
+        scopeType: scope.type,
+        startPage: scope.startPage,
+        endPage: scope.endPage,
+        startPosition: scope.startPosition,
+        endPosition: scope.endPosition,
       );
 
       if (_currentSessionId == targetSessionId) {
@@ -811,10 +1652,84 @@ class _BookChatScreenState extends State<BookChatScreen> {
       }
     } on GeminiCancelledException {
       // Stopped by user
+      AgentTraceStorage.instance.removeLiveExecution(liveExecutionId);
     } catch (e) {
       if (token.isCancelled) return;
+      AgentTraceStorage.instance.finishLiveExecution(
+        liveExecutionId,
+        success: false,
+        errorMessage: e.toString(),
+      );
+      try {
+        final failedMatch = turnAgentOrchestrator.lastToolMatch;
+        await AgentTraceStorage.instance.recordTrace(
+          AgentExecutionTrace(
+            id: 'turn_${messageTimestamp.microsecondsSinceEpoch}',
+            sessionId: targetSessionId,
+            chatTitle: _resolveChatTitle(targetSessionId, book, userDisplay),
+            timestamp: messageTimestamp,
+            userMessage: userDisplay,
+            studentForm: _selectedForm,
+            systemPrompt: capturedSystemPrompt,
+            augmentedPrompt: capturedAugmentedPrompt,
+            injectedContext: injectedContextSummary,
+            finalAnswer: null,
+            modelName: candidateQueue.isNotEmpty
+                ? candidateQueue.first.displayName
+                : null,
+            mode: mode.name,
+            internalThought: agentToolCalls.isEmpty
+                ? 'Jawaabta AI-ga way fashilantay; tool lama adeegsan.'
+                : 'Jawaabta AI-ga way fashilantay kadib ${agentToolCalls.length} tool-call.',
+            status: AgentVerificationStatus.failed,
+            matchedBookId: failedMatch?.book.id ?? book?.id,
+            matchedBookTitle: failedMatch?.book.title ?? book?.title,
+            matchedCategory: failedMatch?.book.category ?? book?.category,
+            matchedChapterTitle: failedMatch?.chapter.title ?? _focusChapter,
+            matchedLessonTitle: failedMatch?.lesson.title ?? _focusLesson,
+            totalLatencyMs: DateTime.now()
+                .difference(messageTimestamp)
+                .inMilliseconds,
+            modelLatencyMs: agentModelCalls.fold<int>(
+              0,
+              (sum, call) => sum + call.latencyMs,
+            ),
+            modelCalls: agentModelCalls,
+            toolCalls: agentToolCalls,
+            isSuccess: false,
+            errorMessage: e.toString(),
+          ),
+        );
+      } catch (_) {}
+      // Record failed app telemetry
+      AppTelemetryStorage.instance.recordLog(
+        AppTelemetryLog(
+          id: '${DateTime.now().millisecondsSinceEpoch}',
+          timestamp: messageTimestamp,
+          userMessage: userDisplay,
+          bookId: book?.id,
+          bookTitle: book?.title,
+          bookCategory: book?.category,
+          focusChapter: _focusChapter,
+          focusLesson: _focusLesson,
+          focusSection: _focusSection,
+          scopeLabel: book != null ? scope.label : null,
+          isSuccess: false,
+          finalErrorMessage: e.toString(),
+          attempts: telemetryAttempts,
+        ),
+      );
       if (mounted && _currentSessionId == targetSessionId) {
-        setState(() => _error = 'Su’aasha lama dirin: $e');
+        setState(() {
+          _error = 'Su’aasha lama dirin: $e';
+          _lastFailedQuestion = userDisplay;
+          _lastFailedMode = mode;
+          if (_messages.isNotEmpty && _messages.last.isUser) {
+            _messages[_messages.length - 1] = _messages.last.copyWithFailed(
+              true,
+            );
+          }
+        });
       }
     } finally {
       _activeGenerations.remove(targetSessionId);
@@ -831,33 +1746,7 @@ class _BookChatScreenState extends State<BookChatScreen> {
     String answer,
     Uint8List? slicedPdfBytes,
   ) async {
-    if (slicedPdfBytes == null || slicedPdfBytes.isEmpty) return const [];
-    final markers = _readVisualMarkers(answer);
-    if (markers.isEmpty) return const [];
-
-    final visuals = <ChatVisualModel>[];
-    for (final marker in markers.take(2)) {
-      try {
-        final thumbnail = await _pdfVisualCropService.cropPage(
-          pdfBytes: slicedPdfBytes,
-          pageNumber: marker.page,
-          left: marker.left,
-          top: marker.top,
-          width: marker.width,
-          height: marker.height,
-        );
-        if (thumbnail != null && thumbnail.isNotEmpty) {
-          final path = await _pdfVisualCropService.saveThumbnail(
-            thumbnail,
-            id: '$_currentSessionId-${DateTime.now().microsecondsSinceEpoch}-${visuals.length}',
-          );
-          visuals.add(marker.withThumbnail(thumbnail, path: path));
-        }
-      } catch (error) {
-        debugPrint('Could not crop lesson visual: $error');
-      }
-    }
-    return visuals;
+    return const [];
   }
 
   List<ChatVisualModel> _readVisualMarkers(String answer) {
@@ -892,6 +1781,27 @@ class _BookChatScreenState extends State<BookChatScreen> {
         : recent;
   }
 
+  String _recentConversationContext() {
+    // The current user message is already in _messages; history supplies the
+    // turns that let the model resolve references such as "explain that again".
+    final history = _messages.length > 1
+        ? _messages.sublist(0, _messages.length - 1)
+        : const <_ChatEntry>[];
+    final recent = history
+        .where((entry) => entry.text.trim().isNotEmpty)
+        .toList()
+        .reversed
+        .take(12)
+        .toList()
+        .reversed
+        .map(
+          (entry) => '${entry.isUser ? 'Ardayga' : 'Leyli AI'}: ${entry.text}',
+        )
+        .join('\n');
+    if (recent.length <= 6000) return recent;
+    return recent.substring(recent.length - 6000);
+  }
+
   bool _isLessonExplanationRequest(TutorMode mode, String userPrompt) {
     if (mode == TutorMode.teach) return true;
     if (mode != TutorMode.freeChat) return false;
@@ -905,8 +1815,9 @@ class _BookChatScreenState extends State<BookChatScreen> {
 
   Future<void> _continueToNextPart() async {
     final session = _learningSession;
-    if (session == null || !session.hasNextPart || _isCurrentSessionSending)
+    if (session == null || !session.hasNextPart || _isCurrentSessionSending) {
       return;
+    }
 
     setState(() {
       _learningSession = session.copyWith(
@@ -933,6 +1844,7 @@ class _BookChatScreenState extends State<BookChatScreen> {
   }
 
   void _resetFocus() {
+    _isFocusManuallyCleared = true;
     _focusChapter = null;
     _focusLesson = null;
     _focusSection = null;
@@ -986,15 +1898,7 @@ class _BookChatScreenState extends State<BookChatScreen> {
     if (book == null) return;
 
     if (_isCurrentSessionSending) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Sug jawaabta hadda socota ka hor intaadan casharka beddelin ama jooji adoo riixaya badhanka Jooji.',
-          ),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
-      return;
+      _stopCurrentGeneration();
     }
 
     final nextSession = LearningSession(
@@ -1022,6 +1926,7 @@ class _BookChatScreenState extends State<BookChatScreen> {
     if (!mounted) return;
 
     setState(() {
+      _isFocusManuallyCleared = false;
       _currentSessionId = nextSession.id;
       _learningSession = nextSession;
       _focusChapter = chapterTitle;
@@ -1155,6 +2060,56 @@ class _BookChatScreenState extends State<BookChatScreen> {
           ],
         ),
         actions: [
+          // Model Selector Button (Hidden from student chat when automated routing is enabled)
+          if (!_hideModelPicker)
+            InkWell(
+              onTap: _showModelPickerSheet,
+              borderRadius: BorderRadius.circular(12),
+              child: Container(
+                margin: const EdgeInsets.symmetric(vertical: 9, horizontal: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHighest.withValues(
+                    alpha: 0.7,
+                  ),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: theme.colorScheme.outlineVariant.withValues(
+                      alpha: 0.6,
+                    ),
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.smart_toy_rounded,
+                      size: 15,
+                      color: theme.colorScheme.primary,
+                    ),
+                    const SizedBox(width: 5),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 95),
+                      child: Text(
+                        _activeAiModel?.displayName ?? 'Gemini AI',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(width: 2),
+                    Icon(
+                      Icons.keyboard_arrow_down_rounded,
+                      size: 16,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ],
+                ),
+              ),
+            ),
           IconButton(
             tooltip: 'Chat Cusub',
             icon: const Icon(Icons.add_comment_outlined),
@@ -1165,27 +2120,82 @@ class _BookChatScreenState extends State<BookChatScreen> {
             icon: const Icon(Icons.local_library_outlined),
             onPressed: widget.onOpenLibrary,
           ),
-          IconButton(
-            tooltip: 'Editor-ka',
-            icon: const Icon(Icons.edit_note_rounded),
-            onPressed: widget.onOpenEditor,
+          ValueListenableBuilder<bool>(
+            valueListenable: AdminAuthService.instance.isAdminNotifier,
+            builder: (context, isAdmin, _) {
+              if (!isAdmin) return const SizedBox.shrink();
+              return Tooltip(
+                message: 'Editor-ka',
+                child: Container(
+                  margin: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0022FF).withValues(alpha: 0.08),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: const Color(0xFF0022FF).withValues(alpha: 0.25),
+                      width: 1,
+                    ),
+                  ),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(10),
+                    onTap: () {
+                      if (widget.onOpenAdmin != null) {
+                        widget.onOpenAdmin!();
+                      } else {
+                        widget.onOpenEditor?.call();
+                      }
+                    },
+                    child: const Padding(
+                      padding: EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 5,
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.admin_panel_settings_rounded,
+                            color: Color(0xFF0022FF),
+                            size: 19,
+                          ),
+                          SizedBox(width: 5),
+                          Text(
+                            'Admin',
+                            style: TextStyle(
+                              color: Color(0xFF0022FF),
+                              fontWeight: FontWeight.bold,
+                              fontSize: 12.5,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            },
           ),
         ],
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
-          : Column(
+          : Stack(
               children: [
-                Expanded(
+                Positioned.fill(
                   child: _messages.isEmpty
                       ? (book == null
                             ? _buildEmptyNoBookChatState(theme)
                             : _buildBookWelcomeCard(book, theme))
                       : ListView.builder(
                           controller: _scrollController,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 12,
+                          padding: EdgeInsets.fromLTRB(
+                            16,
+                            12,
+                            16,
+                            (_activeChapterPopup != null ? 310 : 125),
                           ),
                           itemCount:
                               _messages.length +
@@ -1198,10 +2208,51 @@ class _BookChatScreenState extends State<BookChatScreen> {
                           },
                         ),
                 ),
-                if (_error != null) _buildErrorBanner(theme),
-                _buildBottomArea(theme),
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_error != null) _buildErrorBanner(theme),
+                      _buildBottomArea(theme),
+                    ],
+                  ),
+                ),
               ],
             ),
+    );
+  }
+
+  Widget _drawerProfileBadge(IconData icon, String label, Color color) {
+    return Flexible(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.10),
+          borderRadius: BorderRadius.circular(7),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 11, color: color),
+            const SizedBox(width: 4),
+            Flexible(
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 9.5,
+                  color: color,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -1263,7 +2314,123 @@ class _BookChatScreenState extends State<BookChatScreen> {
                 ],
               ),
             ),
-            // New Chat Action Button
+            // Profile shortcut sits directly below the app header.
+            ValueListenableBuilder<UserProfile?>(
+              valueListenable: UserAuthService.instance.currentUserNotifier,
+              builder: (context, user, _) {
+                if (user == null) return const SizedBox.shrink();
+                return Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 10, 14, 4),
+                  child: Material(
+                    color: const Color(0xFFF5F7FF),
+                    borderRadius: BorderRadius.circular(16),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(16),
+                      onTap: () {
+                        Navigator.pop(context);
+                        StudentProfileDialog.show(
+                          context,
+                          onAccountChanged: () {
+                            _initChat();
+                            _loadActiveAiModel();
+                          },
+                        );
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.all(13),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: const Color(
+                              0xFF0022FF,
+                            ).withValues(alpha: 0.16),
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            CircleAvatar(
+                              radius: 23,
+                              backgroundColor: Color(user.avatarColorValue),
+                              foregroundImage:
+                                  user.photoUrl != null &&
+                                      user.photoUrl!.isNotEmpty
+                                  ? NetworkImage(user.photoUrl!)
+                                  : null,
+                              child:
+                                  user.photoUrl == null ||
+                                      user.photoUrl!.isEmpty
+                                  ? Text(
+                                      user.initials,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    )
+                                  : null,
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    user.displayName,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 13,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 3),
+                                  Text(
+                                    user.email,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: theme.colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 7),
+                                  Row(
+                                    children: [
+                                      _drawerProfileBadge(
+                                        Icons.school_rounded,
+                                        user.selectedForm,
+                                        const Color(0xFF0022FF),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      _drawerProfileBadge(
+                                        user.isSubscriptionActive
+                                            ? Icons.workspace_premium_rounded
+                                            : Icons.check_circle_rounded,
+                                        user.isSubscriptionActive
+                                            ? 'VIP'
+                                            : 'Firfircoon · Free',
+                                        user.isSubscriptionActive
+                                            ? const Color(0xFFD97706)
+                                            : const Color(0xFF15803D),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            const Icon(
+                              Icons.arrow_forward_ios_rounded,
+                              size: 14,
+                              color: Color(0xFF0022FF),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ), // New Chat Action Button
             Padding(
               padding: const EdgeInsets.fromLTRB(14, 14, 14, 8),
               child: SizedBox(
@@ -1294,7 +2461,42 @@ class _BookChatScreenState extends State<BookChatScreen> {
                 children: [
                   // Maktabadda In-Menu Toggle Section with Form Selector Icon Window
                   _buildDrawerLibrarySection(theme),
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 4),
+
+                  // Voice Settings in Drawer
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 2,
+                    ),
+                    child: ListTile(
+                      dense: true,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      leading: const Icon(
+                        Icons.record_voice_over_rounded,
+                        size: 18,
+                        color: Color(0xFF1A73E8),
+                      ),
+                      title: const Text(
+                        'Habeynta Codka (Gemini TTS)',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      trailing: const Icon(
+                        Icons.chevron_right_rounded,
+                        size: 18,
+                      ),
+                      onTap: () {
+                        Navigator.pop(context);
+                        _showVoiceSettingsSheet(context);
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 8),
 
                   // History Section Header
                   Padding(
@@ -1446,17 +2648,39 @@ class _BookChatScreenState extends State<BookChatScreen> {
               ),
             ),
             const Divider(height: 1),
-            // Bottom quick link to Book Editor
-            ListTile(
-              dense: true,
-              leading: const Icon(Icons.edit_note_rounded, size: 19),
-              title: const Text(
-                'Editor-ka Buugaagta',
-                style: TextStyle(fontSize: 12.5),
-              ),
-              onTap: () {
-                Navigator.pop(context);
-                widget.onOpenEditor?.call();
+            // Bottom quick link to Admin Dashboard (Admin only)
+            ValueListenableBuilder<bool>(
+              valueListenable: AdminAuthService.instance.isAdminNotifier,
+              builder: (context, isAdmin, _) {
+                if (!isAdmin) return const SizedBox.shrink();
+                return ListTile(
+                  dense: true,
+                  leading: const Icon(
+                    Icons.admin_panel_settings_rounded,
+                    size: 20,
+                    color: Color(0xFF0022FF),
+                  ),
+                  title: const Text(
+                    'Admin Dashboard',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF0022FF),
+                    ),
+                  ),
+                  subtitle: const Text(
+                    'Maamulka Buugaagta & AI-ga',
+                    style: TextStyle(fontSize: 11),
+                  ),
+                  onTap: () {
+                    Navigator.pop(context);
+                    if (widget.onOpenAdmin != null) {
+                      widget.onOpenAdmin!();
+                    } else {
+                      widget.onOpenEditor?.call();
+                    }
+                  },
+                );
               },
             ),
           ],
@@ -1473,7 +2697,7 @@ class _BookChatScreenState extends State<BookChatScreen> {
 
     return Center(
       child: SingleChildScrollView(
-        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+        padding: const EdgeInsets.fromLTRB(24, 24, 24, 130),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -1576,7 +2800,7 @@ class _BookChatScreenState extends State<BookChatScreen> {
   Widget _buildBookWelcomeCard(PreparedBook book, ThemeData theme) {
     return Center(
       child: SingleChildScrollView(
-        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+        padding: const EdgeInsets.fromLTRB(24, 24, 24, 130),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -1684,6 +2908,7 @@ class _BookChatScreenState extends State<BookChatScreen> {
     final isUser = entry.isUser;
 
     if (isUser) {
+      final isFailed = entry.isFailed;
       return Align(
         alignment: Alignment.centerRight,
         child: Container(
@@ -1691,7 +2916,14 @@ class _BookChatScreenState extends State<BookChatScreen> {
           margin: const EdgeInsets.only(bottom: 14, left: 48),
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
           decoration: BoxDecoration(
-            color: theme.colorScheme.primaryContainer,
+            color: isFailed
+                ? const Color(0xFFFEF2F2)
+                : theme.colorScheme.primaryContainer,
+            border: isFailed
+                ? Border.all(
+                    color: const Color(0xFFEF4444).withValues(alpha: 0.5),
+                  )
+                : null,
             borderRadius: const BorderRadius.only(
               topLeft: Radius.circular(18),
               topRight: Radius.circular(4),
@@ -1699,13 +2931,59 @@ class _BookChatScreenState extends State<BookChatScreen> {
               bottomRight: Radius.circular(18),
             ),
           ),
-          child: SelectableText(
-            entry.text,
-            style: TextStyle(
-              color: theme.colorScheme.onPrimaryContainer,
-              fontSize: 14.5,
-              height: 1.4,
-            ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SelectableText(
+                entry.text,
+                style: TextStyle(
+                  color: isFailed
+                      ? const Color(0xFF991B1B)
+                      : theme.colorScheme.onPrimaryContainer,
+                  fontSize: 14.5,
+                  height: 1.4,
+                ),
+              ),
+              if (isFailed && !_isCurrentSessionSending) ...[
+                const SizedBox(height: 6),
+                InkWell(
+                  onTap: () {
+                    setState(() => _error = null);
+                    _executeTutorAction(
+                      _lastFailedMode ?? TutorMode.freeChat,
+                      customPrompt: entry.text,
+                    );
+                  },
+                  borderRadius: BorderRadius.circular(6),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 4,
+                      vertical: 2,
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.refresh_rounded,
+                          size: 14,
+                          color: Colors.red.shade700,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          'Ma dirmin • Taabo si aad mar kale ugu celiso (Retry)',
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.red.shade700,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ],
           ),
         ),
       );
@@ -1768,15 +3046,6 @@ class _BookChatScreenState extends State<BookChatScreen> {
               text: _removeVisualMarkers(entry.text),
               isUser: false,
             ),
-            if (entry.visuals.isNotEmpty)
-              ...entry.visuals
-                  .where(
-                    (visual) =>
-                        visual.thumbnailBytes != null ||
-                        (visual.thumbnailPath != null &&
-                            File(visual.thumbnailPath!).existsSync()),
-                  )
-                  .map(_buildInlineLessonVisual),
             const SizedBox(height: 6),
             if (entry.isLessonComplete)
               Container(
@@ -1836,9 +3105,103 @@ class _BookChatScreenState extends State<BookChatScreen> {
                 ),
               ),
             ],
+            if (entry.hasPdf || entry.pagesLabel != null) ...[
+              const SizedBox(height: 6),
+              _buildCitationChip(entry),
+              const SizedBox(height: 2),
+            ],
             Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
+                ValueListenableBuilder<TtsPlaybackState>(
+                  valueListenable: _ttsService.stateNotifier,
+                  builder: (context, ttsState, _) {
+                    final messageId = 'msg_${entry.text.hashCode}';
+                    final isLoading = ttsState.isLoadingFor(messageId);
+                    final isPlaying = ttsState.isPlayingFor(messageId);
+                    final isPaused = ttsState.isPausedFor(messageId);
+
+                    if (isLoading) {
+                      return IconButton(
+                        icon: SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: theme.colorScheme.primary,
+                          ),
+                        ),
+                        tooltip: 'Jooji diyaarinta codka',
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () async {
+                          await _ttsService.stop();
+                        },
+                      );
+                    }
+
+                    return GestureDetector(
+                      onLongPress: () => _showVoiceSettingsSheet(context),
+                      child: IconButton(
+                        icon: Icon(
+                          isPlaying
+                              ? Icons.stop_rounded
+                              : isPaused
+                              ? Icons.play_arrow_rounded
+                              : Icons.volume_up_rounded,
+                          size: 19,
+                          color: isPlaying
+                              ? Colors.red.shade600
+                              : isPaused
+                              ? const Color(0xFF1A73E8)
+                              : theme.colorScheme.onSurfaceVariant,
+                        ),
+                        tooltip: isPlaying
+                            ? 'Jooji codka'
+                            : isPaused
+                            ? 'Sii wad codka'
+                            : 'Dhegeyso codka (Gemini TTS)\nTaabo dheer si aad codka u baddasho',
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () async {
+                          if (isPlaying) {
+                            await _ttsService.stop();
+                          } else if (isPaused) {
+                            _ttsService.resume();
+                          } else {
+                            try {
+                              await _ttsService.speak(
+                                id: messageId,
+                                text: entry.text,
+                                modelConfig: _activeAiModel,
+                              );
+                            } catch (err) {
+                              if (context.mounted) {
+                                final friendly =
+                                    GeminiTtsService.formatFriendlyError(err);
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Row(
+                                      children: [
+                                        const Icon(
+                                          Icons.error_outline_rounded,
+                                          color: Colors.white,
+                                          size: 20,
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Expanded(child: Text(friendly)),
+                                      ],
+                                    ),
+                                    backgroundColor: Colors.red.shade800,
+                                    behavior: SnackBarBehavior.floating,
+                                  ),
+                                );
+                              }
+                            }
+                          }
+                        },
+                      ),
+                    );
+                  },
+                ),
                 IconButton(
                   icon: const Icon(Icons.copy_rounded, size: 16),
                   tooltip: 'Koobiyeey',
@@ -1858,6 +3221,256 @@ class _BookChatScreenState extends State<BookChatScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  Widget _buildCitationChip(_ChatEntry entry) {
+    const blueColor = Color(0xFF0022FF);
+    final targetBook = entry.bookTitle != null
+        ? _availableBooks.cast<PreparedBook?>().firstWhere(
+                (b) => b?.title == entry.bookTitle,
+                orElse: () => _currentBook,
+              ) ??
+              _currentBook
+        : _currentBook;
+    final displayScope =
+        entry.sectionTitle ??
+        entry.lessonTitle ??
+        entry.scopeLabel ??
+        'MANHAJKA';
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: () => _openMiniPdfSliceViewer(
+            pdfBytes: entry.pdfBytes,
+            book: targetBook,
+            lessonTitle: displayScope,
+            startPage: entry.startPage,
+            endPage: entry.endPage,
+            startPosition: entry.startPosition,
+            endPosition: entry.endPosition,
+            pagesLabel: entry.pagesLabel,
+          ),
+          borderRadius: BorderRadius.circular(6),
+          hoverColor: blueColor.withValues(alpha: 0.08),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Flexible(
+                  child: Text(
+                    'MANHAJKA: $displayScope',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: blueColor,
+                      letterSpacing: 0.3,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 4),
+                const Icon(
+                  Icons.arrow_outward_rounded,
+                  size: 15,
+                  color: blueColor,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openMiniPdfSliceViewer({
+    Uint8List? pdfBytes,
+    PreparedBook? book,
+    required String lessonTitle,
+    int? startPage,
+    int? endPage,
+    double? startPosition,
+    double? endPosition,
+    String? pagesLabel,
+  }) async {
+    Uint8List? bytes = pdfBytes;
+    if (bytes == null || bytes.isEmpty) {
+      final activeBook = book ?? _currentBook;
+      if (activeBook != null) {
+        final currentScope = _resolveCurrentScope();
+        final sPage = startPage ?? currentScope.startPage;
+        final ePage = endPage ?? currentScope.endPage;
+        final sPos = startPosition ?? currentScope.startPosition;
+        final ePos = endPosition ?? currentScope.endPosition;
+        if (mounted) {
+          ScaffoldMessenger.of(context).hideCurrentSnackBar();
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Row(
+                children: [
+                  SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Colors.white,
+                    ),
+                  ),
+                  SizedBox(width: 8),
+                  Text('Soo saarista qaybta PDF-ka ee Manhajka...'),
+                ],
+              ),
+              duration: Duration(milliseconds: 1200),
+            ),
+          );
+        }
+        try {
+          bytes = await _obtainScopePdf(
+            book: activeBook,
+            startPage: sPage,
+            endPage: ePage,
+            startPosition: sPos,
+            endPosition: ePos,
+            scopeTitle: lessonTitle,
+          );
+        } catch (e) {
+          debugPrint('Error obtaining scope PDF: $e');
+        }
+      }
+    }
+
+    if (!mounted) return;
+
+    if (bytes == null || bytes.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Lama heli karo qaybta PDF-ka ee casharkan.'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+
+    final pdfData = bytes;
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogCtx) {
+        final screenWidth = MediaQuery.of(dialogCtx).size.width;
+        final screenHeight = MediaQuery.of(dialogCtx).size.height;
+
+        return Dialog(
+          backgroundColor: Colors.transparent,
+          insetPadding: const EdgeInsets.symmetric(
+            horizontal: 20,
+            vertical: 20,
+          ),
+          child: Container(
+            width: screenWidth > 860 ? 820 : screenWidth * 0.94,
+            height: screenHeight * 0.86,
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.28),
+                  blurRadius: 28,
+                  offset: const Offset(0, 10),
+                ),
+              ],
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(16),
+              child: Column(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 12,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      border: Border(
+                        bottom: BorderSide(
+                          color: Colors.grey.shade200,
+                          width: 1,
+                        ),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(6),
+                          child: Image.asset(
+                            'assets/icon-Leyli AI.png',
+                            width: 26,
+                            height: 26,
+                            fit: BoxFit.contain,
+                            errorBuilder: (_, __, ___) => const Icon(
+                              Icons.menu_book_rounded,
+                              size: 24,
+                              color: Color(0xFF0022FF),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        const Text(
+                          'Leyli AI',
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w800,
+                            color: Color(0xFF0022FF),
+                            letterSpacing: -0.2,
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Container(
+                          width: 1.2,
+                          height: 16,
+                          color: Colors.grey.shade300,
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            lessonTitle,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 13.5,
+                              fontWeight: FontWeight.w600,
+                              color: Color(0xFF0F172A),
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close_rounded, size: 20),
+                          tooltip: 'Xir',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => Navigator.pop(dialogCtx),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Expanded(
+                    child: SfPdfViewer.memory(
+                      pdfData,
+                      canShowScrollHead: false,
+                      canShowScrollStatus: false,
+                      enableDoubleTapZooming: true,
+                      pageLayoutMode: PdfPageLayoutMode.continuous,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -1992,16 +3605,13 @@ class _BookChatScreenState extends State<BookChatScreen> {
                 decoration: BoxDecoration(
                   color: isAllBookSelected
                       ? theme.colorScheme.primary
-                      : theme.colorScheme.surfaceContainerHighest.withValues(
-                          alpha: 0.55,
-                        ),
+                      : theme.colorScheme.surfaceContainerHighest,
                   borderRadius: BorderRadius.circular(16),
                   border: Border.all(
                     color: isAllBookSelected
                         ? theme.colorScheme.primary
-                        : theme.colorScheme.outlineVariant.withValues(
-                            alpha: 0.5,
-                          ),
+                        : theme.colorScheme.outline.withValues(alpha: 0.5),
+                    width: isAllBookSelected ? 1.3 : 1.0,
                   ),
                 ),
                 child: Row(
@@ -2053,17 +3663,18 @@ class _BookChatScreenState extends State<BookChatScreen> {
     return Container(
       decoration: BoxDecoration(
         color: isChapterActive
-            ? theme.colorScheme.primaryContainer.withValues(alpha: 0.7)
+            ? theme.colorScheme.primaryContainer
             : isPopupOpen
             ? theme.colorScheme.surfaceContainerHighest
-            : theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.45),
+            : theme.colorScheme.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
           color: isChapterActive
-              ? theme.colorScheme.primary.withValues(alpha: 0.7)
+              ? theme.colorScheme.primary
               : isPopupOpen
-              ? theme.colorScheme.primary.withValues(alpha: 0.4)
-              : theme.colorScheme.outlineVariant.withValues(alpha: 0.5),
+              ? theme.colorScheme.primary
+              : theme.colorScheme.outline.withValues(alpha: 0.5),
+          width: isChapterActive || isPopupOpen ? 1.3 : 1.0,
         ),
       ),
       child: Row(
@@ -2380,37 +3991,108 @@ class _BookChatScreenState extends State<BookChatScreen> {
       decoration: BoxDecoration(
         color: theme.colorScheme.errorContainer,
         borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: theme.colorScheme.error.withValues(alpha: 0.3),
+        ),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Icon(
-            Icons.warning_amber_rounded,
-            color: theme.colorScheme.onErrorContainer,
-            size: 20,
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              _error!,
-              style: TextStyle(
+          Row(
+            children: [
+              Icon(
+                Icons.warning_amber_rounded,
                 color: theme.colorScheme.onErrorContainer,
-                fontSize: 12.5,
+                size: 20,
               ),
-            ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  _error!,
+                  style: TextStyle(
+                    color: theme.colorScheme.onErrorContainer,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.close_rounded, size: 18),
+                color: theme.colorScheme.onErrorContainer,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+                onPressed: () => setState(() => _error = null),
+                tooltip: 'Xir',
+              ),
+            ],
           ),
+          if (_lastFailedQuestion != null && !_isCurrentSessionSending) ...[
+            const SizedBox(height: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                // Ku celi sanduuqa qoraalka (Edit in input)
+                TextButton.icon(
+                  onPressed: () {
+                    setState(() {
+                      _questionController.text = _lastFailedQuestion!;
+                      _error = null;
+                    });
+                  },
+                  icon: const Icon(Icons.edit_note_rounded, size: 16),
+                  label: const Text(
+                    'Ku celi Qoraalka (Edit)',
+                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                  ),
+                  style: TextButton.styleFrom(
+                    foregroundColor: theme.colorScheme.onErrorContainer,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                // Toos dib ugu celi oo isku day markale
+                ElevatedButton.icon(
+                  onPressed: () {
+                    final q = _lastFailedQuestion!;
+                    final m = _lastFailedMode ?? TutorMode.freeChat;
+                    setState(() => _error = null);
+                    _executeTutorAction(m, customPrompt: q);
+                  },
+                  icon: const Icon(Icons.refresh_rounded, size: 16),
+                  label: const Text(
+                    'Isku day Mar Kale (Retry)',
+                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: theme.colorScheme.error,
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
         ],
       ),
     );
   }
 
   Widget _buildInputBar(ThemeData theme) {
-    final focusScopeTitle = _focusSection ?? _focusLesson ?? _focusChapter;
+    final activeScopeName = _currentFocusScopeName;
     final hasFocusScope =
-        focusScopeTitle != null && focusScopeTitle.trim().isNotEmpty;
+        activeScopeName != null && activeScopeName.trim().isNotEmpty;
     final shortScopeTitle = hasFocusScope
-        ? (focusScopeTitle.trim().length > 10
-              ? '${focusScopeTitle.trim().substring(0, 10)}...'
-              : focusScopeTitle.trim())
+        ? _formatScope12(activeScopeName)
         : '';
 
     const hint = 'Weydii Leyli AI su\'aal kasta...';
@@ -2448,10 +4130,10 @@ class _BookChatScreenState extends State<BookChatScreen> {
                   hintText: hint,
                   prefixIcon: PopupMenuButton<PreparedBook>(
                     tooltip: 'Buugaagta',
-                    icon: const Icon(
+                    icon: Icon(
                       Icons.auto_stories_rounded,
                       size: 20,
-                      color: Color(0xFF000000),
+                      color: theme.colorScheme.primary,
                     ),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(16),
@@ -2533,23 +4215,20 @@ class _BookChatScreenState extends State<BookChatScreen> {
                           ? 'Jooji fariinta'
                           : 'Dir fariinta',
                       style: IconButton.styleFrom(
-                        backgroundColor: _isCurrentSessionSending
-                            ? const Color(0xFFD32F2F)
-                            : theme.colorScheme.primary,
-                        foregroundColor: Colors.white,
+                        backgroundColor: Colors.transparent,
                         minimumSize: const Size(36, 36),
                         padding: EdgeInsets.zero,
                       ),
                       icon: _isCurrentSessionSending
                           ? const Icon(
-                              Icons.stop_rounded,
-                              color: Colors.white,
-                              size: 20,
+                              Icons.stop_circle_rounded,
+                              color: Color(0xFFE53935),
+                              size: 24,
                             )
-                          : const Icon(
+                          : Icon(
                               Icons.send_rounded,
-                              color: Colors.white,
-                              size: 17,
+                              color: theme.colorScheme.primary,
+                              size: 22,
                             ),
                     ),
                   ),
@@ -2560,110 +4239,90 @@ class _BookChatScreenState extends State<BookChatScreen> {
                     fontSize: 13.5,
                   ),
                   filled: true,
-                  fillColor: theme.colorScheme.surfaceContainerHighest
-                      .withValues(alpha: 0.5),
+                  fillColor: theme.colorScheme.surfaceContainerHighest,
                   contentPadding: const EdgeInsets.symmetric(
                     horizontal: 16,
                     vertical: 12,
                   ),
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(24),
-                    borderSide: BorderSide(
-                      color: theme.colorScheme.outline.withValues(alpha: 0.3),
-                    ),
+                    borderSide: BorderSide.none,
                   ),
                   enabledBorder: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(24),
-                    borderSide: BorderSide(
-                      color: theme.colorScheme.outline.withValues(alpha: 0.3),
-                    ),
+                    borderSide: BorderSide.none,
                   ),
                   focusedBorder: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(24),
-                    borderSide: BorderSide(
-                      color: theme.colorScheme.primary,
-                      width: 1.5,
-                    ),
+                    borderSide: BorderSide.none,
                   ),
                 ),
               ),
             ),
-            if (hasFocusScope)
+            if (hasFocusScope && activeScopeName != null)
               Positioned(
                 top: -10,
-                left: 20,
+                left: 18,
                 child: Material(
                   color: Colors.transparent,
-                  child: InkWell(
-                    onTap: () {
-                      ScaffoldMessenger.of(context).hideCurrentSnackBar();
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text('Diiradda: $focusScopeTitle'),
-                          duration: const Duration(seconds: 2),
-                          behavior: SnackBarBehavior.floating,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: theme.colorScheme.primaryContainer,
+                      borderRadius: BorderRadius.circular(10),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.08),
+                          blurRadius: 4,
+                          offset: const Offset(0, 1.5),
                         ),
-                      );
-                    },
-                    borderRadius: BorderRadius.circular(10),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 7,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: theme.colorScheme.surface,
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(
-                          color: theme.colorScheme.primary,
-                          width: 1.2,
-                        ),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.08),
-                            blurRadius: 3,
-                            offset: const Offset(0, 1),
-                          ),
-                        ],
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            Icons.visibility_rounded,
-                            size: 11,
-                            color: theme.colorScheme.primary,
-                          ),
-                          const SizedBox(width: 4),
-                          Text(
+                      ],
+                    ),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 3,
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        InkWell(
+                          onTap: () {
+                            ScaffoldMessenger.of(context).hideCurrentSnackBar();
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text('Diiradda: $activeScopeName'),
+                                duration: const Duration(seconds: 2),
+                                behavior: SnackBarBehavior.floating,
+                              ),
+                            );
+                          },
+                          child: Text(
                             shortScopeTitle,
                             style: TextStyle(
-                              fontSize: 10,
+                              fontSize: 11,
                               fontWeight: FontWeight.w700,
-                              color: theme.colorScheme.primary,
+                              color: theme.colorScheme.onPrimaryContainer,
                             ),
                           ),
-                          const SizedBox(width: 3),
-                          InkWell(
-                            onTap: () {
-                              setState(() {
-                                _resetFocus();
-                              });
-                            },
-                            borderRadius: BorderRadius.circular(6),
-                            child: Padding(
-                              padding: const EdgeInsets.all(1),
-                              child: Icon(
-                                Icons.close_rounded,
-                                size: 10,
-                                color: theme.colorScheme.primary.withValues(
-                                  alpha: 0.8,
-                                ),
-                              ),
+                        ),
+                        const SizedBox(width: 4),
+                        InkWell(
+                          onTap: () {
+                            setState(() {
+                              _resetFocus();
+                            });
+                          },
+                          borderRadius: BorderRadius.circular(8),
+                          child: Padding(
+                            padding: const EdgeInsets.all(1),
+                            child: Icon(
+                              Icons.close_rounded,
+                              size: 13,
+                              color: theme.colorScheme.onPrimaryContainer
+                                  .withValues(alpha: 0.8),
                             ),
                           ),
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -2676,11 +4335,443 @@ class _BookChatScreenState extends State<BookChatScreen> {
 
   Future<void> _changeSelectedForm(String newForm) async {
     await _formStorage.setSelectedForm(newForm);
+    await UserAuthService.instance.updateCurrentProfile(selectedForm: newForm);
     if (mounted) {
       setState(() {
         _selectedForm = newForm;
       });
     }
+  }
+
+  Future<void> _showVoiceSettingsSheet(BuildContext context) async {
+    final theme = Theme.of(context);
+    var selectedVoice = await GeminiTtsService.getSavedVoice();
+    var selectedSpeed = await GeminiTtsService.getSavedSpeed();
+
+    if (!context.mounted) return;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (sheetContext, setModalState) {
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 40,
+                        height: 4,
+                        margin: const EdgeInsets.only(bottom: 16),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.outlineVariant,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.primaryContainer,
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Icon(
+                            Icons.record_voice_over_rounded,
+                            color: theme.colorScheme.primary,
+                            size: 20,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        const Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Habeynta Codka (Gemini TTS)',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              Text(
+                                'Dooro codka iyo xawaaraha aad jeceshahay',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.grey,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 18),
+                    const Text(
+                      'Xulashada Codka:',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    ...GeminiTtsService.availableVoices.map((voice) {
+                      final isSelected = selectedVoice == voice['id'];
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 6),
+                        decoration: BoxDecoration(
+                          color: isSelected
+                              ? theme.colorScheme.primaryContainer.withValues(
+                                  alpha: 0.4,
+                                )
+                              : theme.colorScheme.surfaceContainerHighest
+                                    .withValues(alpha: 0.5),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: isSelected
+                                ? theme.colorScheme.primary
+                                : Colors.transparent,
+                            width: 1.2,
+                          ),
+                        ),
+                        child: ListTile(
+                          dense: true,
+                          title: Text(
+                            voice['title']!,
+                            style: TextStyle(
+                              fontWeight: isSelected
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
+                            ),
+                          ),
+                          subtitle: Text(
+                            '${voice['type']} • ${voice['description']}',
+                            style: const TextStyle(fontSize: 11.5),
+                          ),
+                          trailing: isSelected
+                              ? Icon(
+                                  Icons.check_circle_rounded,
+                                  color: theme.colorScheme.primary,
+                                  size: 20,
+                                )
+                              : null,
+                          onTap: () async {
+                            setModalState(() => selectedVoice = voice['id']!);
+                            await GeminiTtsService.saveVoice(voice['id']!);
+                          },
+                        ),
+                      );
+                    }),
+                    const SizedBox(height: 12),
+                    const Text(
+                      'Xawaaraha Hadalka (Speed):',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: [0.8, 1.0, 1.2, 1.5].map((speed) {
+                        final isSelected = (selectedSpeed - speed).abs() < 0.05;
+                        final label = speed == 1.0
+                            ? '1.0x (Caadi)'
+                            : '${speed}x';
+                        return ChoiceChip(
+                          label: Text(
+                            label,
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                          selected: isSelected,
+                          onSelected: (_) async {
+                            setModalState(() => selectedSpeed = speed);
+                            await GeminiTtsService.saveSpeed(speed);
+                          },
+                        );
+                      }).toList(),
+                    ),
+                    const SizedBox(height: 16),
+                    ValueListenableBuilder<TtsPlaybackState>(
+                      valueListenable: _ttsService.stateNotifier,
+                      builder: (sheetCtx, ttsState, _) {
+                        final isPreviewLoading = ttsState.isLoadingFor(
+                          'tts_test_preview',
+                        );
+                        final isPreviewPlaying = ttsState.isPlayingFor(
+                          'tts_test_preview',
+                        );
+                        final hasError =
+                            ttsState.errorMessage != null &&
+                            ttsState.activeId == 'tts_test_preview';
+
+                        return Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            if (isPreviewLoading)
+                              Container(
+                                margin: const EdgeInsets.only(bottom: 12),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 14,
+                                  vertical: 10,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: theme.colorScheme.primaryContainer
+                                      .withValues(alpha: 0.35),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                    color: theme.colorScheme.primary.withValues(
+                                      alpha: 0.5,
+                                    ),
+                                  ),
+                                ),
+                                child: const Row(
+                                  children: [
+                                    SizedBox(
+                                      width: 16,
+                                      height: 16,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    ),
+                                    SizedBox(width: 10),
+                                    Expanded(
+                                      child: Text(
+                                        'Codka tijaabada ayaa la raadinayaa oo la soo dejinayaa...',
+                                        style: TextStyle(
+                                          fontSize: 12.5,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              )
+                            else if (isPreviewPlaying)
+                              Container(
+                                margin: const EdgeInsets.only(bottom: 12),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 14,
+                                  vertical: 8,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.green.withValues(alpha: 0.12),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                    color: Colors.green.shade600,
+                                    width: 1.2,
+                                  ),
+                                ),
+                                child: Row(
+                                  children: [
+                                    const Icon(
+                                      Icons.volume_up_rounded,
+                                      color: Colors.green,
+                                      size: 20,
+                                    ),
+                                    const SizedBox(width: 10),
+                                    const Expanded(
+                                      child: Text(
+                                        'Codka wuu shaqaynayaa... Fadlan dhegeyso.',
+                                        style: TextStyle(
+                                          fontSize: 12.5,
+                                          fontWeight: FontWeight.w600,
+                                          color: Colors.green,
+                                        ),
+                                      ),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(
+                                        Icons.stop_circle_rounded,
+                                        color: Colors.red,
+                                        size: 22,
+                                      ),
+                                      tooltip: 'Jooji',
+                                      visualDensity: VisualDensity.compact,
+                                      onPressed: _ttsService.stop,
+                                    ),
+                                  ],
+                                ),
+                              )
+                            else if (hasError)
+                              Container(
+                                margin: const EdgeInsets.only(bottom: 12),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 14,
+                                  vertical: 10,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.red.withValues(alpha: 0.12),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                    color: Colors.red.shade400,
+                                    width: 1.2,
+                                  ),
+                                ),
+                                child: Row(
+                                  children: [
+                                    const Icon(
+                                      Icons.error_outline_rounded,
+                                      color: Colors.red,
+                                      size: 20,
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Text(
+                                        ttsState.errorMessage!,
+                                        style: const TextStyle(
+                                          fontSize: 12,
+                                          color: Colors.red,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: OutlinedButton.icon(
+                                    style: OutlinedButton.styleFrom(
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 12,
+                                      ),
+                                      side: BorderSide(
+                                        color: isPreviewPlaying
+                                            ? Colors.red.shade400
+                                            : isPreviewLoading
+                                            ? theme.colorScheme.primary
+                                            : theme.colorScheme.outline,
+                                        width: 1.4,
+                                      ),
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius: BorderRadius.circular(12),
+                                      ),
+                                    ),
+                                    icon: isPreviewLoading
+                                        ? const SizedBox(
+                                            width: 16,
+                                            height: 16,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                              color: Color(0xFF1A73E8),
+                                            ),
+                                          )
+                                        : Icon(
+                                            isPreviewPlaying
+                                                ? Icons.stop_circle_rounded
+                                                : Icons.volume_up_rounded,
+                                            size: 18,
+                                            color: isPreviewPlaying
+                                                ? Colors.red.shade600
+                                                : theme.colorScheme.primary,
+                                          ),
+                                    label: Text(
+                                      isPreviewLoading
+                                          ? 'Raadinaya codka...'
+                                          : isPreviewPlaying
+                                          ? 'Jooji Codka'
+                                          : 'Tijaabi Codka',
+                                      style: TextStyle(
+                                        color: isPreviewPlaying
+                                            ? Colors.red.shade700
+                                            : null,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    onPressed: isPreviewLoading
+                                        ? null
+                                        : () async {
+                                            if (isPreviewPlaying) {
+                                              await _ttsService.stop();
+                                            } else {
+                                              try {
+                                                await _ttsService.speak(
+                                                  id: 'tts_test_preview',
+                                                  text:
+                                                      'Ku soo dhawoow Leyli AI! Waxaan diyaar u ahay inaan kugu caawiyo waxbarashadaada.',
+                                                  voiceName: selectedVoice,
+                                                  modelConfig: _activeAiModel,
+                                                );
+                                              } catch (err) {
+                                                if (ctx.mounted) {
+                                                  final friendly =
+                                                      GeminiTtsService.formatFriendlyError(
+                                                        err,
+                                                      );
+                                                  ScaffoldMessenger.of(
+                                                    ctx,
+                                                  ).showSnackBar(
+                                                    SnackBar(
+                                                      content: Row(
+                                                        children: [
+                                                          const Icon(
+                                                            Icons
+                                                                .error_outline_rounded,
+                                                            color: Colors.white,
+                                                            size: 20,
+                                                          ),
+                                                          const SizedBox(
+                                                            width: 8,
+                                                          ),
+                                                          Expanded(
+                                                            child: Text(
+                                                              friendly,
+                                                            ),
+                                                          ),
+                                                        ],
+                                                      ),
+                                                      backgroundColor:
+                                                          Colors.red.shade800,
+                                                      behavior: SnackBarBehavior
+                                                          .floating,
+                                                    ),
+                                                  );
+                                                }
+                                              }
+                                            }
+                                          },
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: FilledButton(
+                                    style: FilledButton.styleFrom(
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 12,
+                                      ),
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius: BorderRadius.circular(12),
+                                      ),
+                                    ),
+                                    child: const Text('Waa hagaag'),
+                                    onPressed: () => Navigator.pop(ctx),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        );
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
   }
 
   Future<void> _showFormSelectionDialog(BuildContext context) async {
@@ -3226,6 +5317,17 @@ class _ChatEntry {
     this.partIndex,
     this.isLessonComplete = false,
     this.visuals = const [],
+    this.pdfBytes,
+    this.bookTitle,
+    this.chapterTitle,
+    this.lessonTitle,
+    this.sectionTitle,
+    this.scopeType,
+    this.startPage,
+    this.endPage,
+    this.startPosition = 0.0,
+    this.endPosition = 1.0,
+    this.isFailed = false,
   });
 
   final String text;
@@ -3237,6 +5339,40 @@ class _ChatEntry {
   final int? partIndex;
   final bool isLessonComplete;
   final List<ChatVisualModel> visuals;
+  final Uint8List? pdfBytes;
+  final String? bookTitle;
+  final String? chapterTitle;
+  final String? lessonTitle;
+  final String? sectionTitle;
+  final String? scopeType;
+  final int? startPage;
+  final int? endPage;
+  final double startPosition;
+  final double endPosition;
+  final bool isFailed;
+
+  _ChatEntry copyWithFailed(bool failed) => _ChatEntry(
+    text: text,
+    isUser: isUser,
+    scopeLabel: scopeLabel,
+    pagesLabel: pagesLabel,
+    hasPdf: hasPdf,
+    canContinue: canContinue,
+    partIndex: partIndex,
+    isLessonComplete: isLessonComplete,
+    visuals: visuals,
+    pdfBytes: pdfBytes,
+    bookTitle: bookTitle,
+    chapterTitle: chapterTitle,
+    lessonTitle: lessonTitle,
+    sectionTitle: sectionTitle,
+    scopeType: scopeType,
+    startPage: startPage,
+    endPage: endPage,
+    startPosition: startPosition,
+    endPosition: endPosition,
+    isFailed: failed,
+  );
 
   _ChatEntry copyWithVisuals(List<ChatVisualModel> nextVisuals) => _ChatEntry(
     text: text,
@@ -3248,6 +5384,16 @@ class _ChatEntry {
     partIndex: partIndex,
     isLessonComplete: isLessonComplete,
     visuals: nextVisuals,
+    pdfBytes: pdfBytes,
+    bookTitle: bookTitle,
+    chapterTitle: chapterTitle,
+    lessonTitle: lessonTitle,
+    sectionTitle: sectionTitle,
+    scopeType: scopeType,
+    startPage: startPage,
+    endPage: endPage,
+    startPosition: startPosition,
+    endPosition: endPosition,
   );
 }
 
